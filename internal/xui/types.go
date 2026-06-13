@@ -1,10 +1,20 @@
-// Package xui 实现对 3x-ui 面板 /panel/api/inbounds/* API 的客户端。
+// Package xui 实现对 3x-ui 面板 /panel/api/* API 的客户端。
+//
+// v0.8.3 起仅适配 3x-ui v3.3+，这是因为 v3.3 主线把 client 增删改 / onlines /
+// ips 五个端点从 /panel/api/inbounds/{addClient,updateClient/:key,:id/
+// delClientByEmail/:email,clientIps/:email,onlines} 集体搬到了
+// /panel/api/clients/{bulkCreate,update/:email,del/:email,ips/:email,onlines}，
+// 同时请求 / 响应体形态彻底重构（详见 ClientPayload / BulkCreateItem /
+// BulkCreateResult 注释）。inbound 自身的 CRUD（/list, /get/:id 等）仍走
+// /panel/api/inbounds/* 不变。
 //
 // 3x-ui 的 API 风格特征：
 //
-//  1. 所有响应包装在 {success:bool, msg:string, obj:any}；success=false 即业务错误。
+//  1. 所有响应包装在 {success:bool, msg:string, obj:any}；success=false 即业务
+//     错误。但 bulkCreate 等批量端点即使有部分项失败也会顶层 success=true，
+//     需要解码 obj 检查 skipped 字段——详见 BulkCreateResult 注释。
 //  2. inbound 的 settings / streamSettings / sniffing 是嵌入对象的 JSON 字符串
-//     （二次 JSON），增删 client 时必须解码 → 改 → 重新编码。
+//     （二次 JSON），从 /panel/api/inbounds/list 拉取做 diff 时仍需解码。
 //  3. 鉴权 v0.6 起仅 Bearer API Token 单通道，仅适配 3x-ui v3.0.0+：
 //     每次请求都在 Authorization 头注入 "Bearer <APIToken>"；3x-ui 主线
 //     APIController.checkAPIAuth 走 MatchApiToken 通道并让 CSRFMiddleware
@@ -72,34 +82,93 @@ type ClientTraffic struct {
 	LastOnline int64  `json:"lastOnline"`
 }
 
-// AddClientReq 是 POST /panel/api/inbounds/addClient 的请求体。
+// ClientPayload 是 3x-ui v3.3+ /panel/api/clients/* 端点的 client 字段 wire 形态，
+// 字段命名与 3x-ui 主线 database/model.Client 一一对齐（部分字段为减小 wire
+// 体积加了 omitempty，故 struct tag 与 model.Client 不完全字符串相等）。
 //
-// 关键约定（来自 3x-ui controller/inbound.go addInboundClient）：
+// v3.3 主线把 client 增删改 / onlines / ips 五个端点从
+// /panel/api/inbounds/{addClient,updateClient/:key,:id/delClientByEmail/:email,
+// clientIps/:email,onlines} 集体搬到 /panel/api/clients/{bulkCreate,
+// update/:email,del/:email,ips/:email,onlines}（详见 3x-ui internal/web/
+// controller/{client.go,inbound.go,api.go}）。同时 wire 形态也重构：
 //
-//   - 必须填 ID = 目标 inbound id；后端按此找到 inbound 并 merge clients。
-//   - Settings 是一个新构造的 settings JSON 字符串，仅包含本次新增的 clients 数组。
-//   - 后端不要求 streamSettings / sniffing / port / protocol，但若填写也不会报错。
+//   - addClient 旧体 {id:inboundID, settings:JSON 字符串} → bulkCreate 新体
+//     [{client: ClientPayload, inboundIds: []int}]；
+//   - updateClient 旧路径 :clientKey + 旧体 {id, settings} → update/:email +
+//     body 直接是 ClientPayload，可选 ?inboundIds= query 限定作用域；
+//   - shadowsocks 的 per-client 加密方法 JSON 键由 "method" 改名为 "security"。
 //
-// 一次可以批量新增多个 client：把它们都塞进 Settings.clients。
-type AddClientReq struct {
-	ID       int    `json:"id"`
-	Settings string `json:"settings"`
+// 字段语义：
+//
+//	ID        UUID（vless / vmess 必填；其它协议留空让服务端 fillProtocolDefaults 补）
+//	Security  shadowsocks 的 method 字段（per-client；bridge 当前不主动设置，
+//	          由 3x-ui 服务端 fillProtocolDefaults 根据 inbound.settings.method 决定）
+//	Password  trojan / shadowsocks 的密码
+//	Flow      vless XTLS flow
+//	Auth      hysteria / hysteria2 的 auth_str
+//	Email     强制唯一标识；新版 update / del 都按 email 路由
+//	LimitIP / TotalGB / ExpiryTime / Enable / SubID / Reset
+//
+// 注意：3x-ui v3.3+ 的 Create 路径会按 Email 查 ClientRecord 检测 SubID 一致性
+// （详见 3x-ui internal/web/service/client_crud.go:74-84）。bridge 当前不主动
+// 设置 SubID（让 3x-ui 自动随机生成），由此带来的"detach 后无法再 create"边角
+// 已通过改用 /del/:email（硬删）规避——硬删会一并清掉 ClientRecord，下次
+// bulkCreate 是全新插入，不会撞 SubID 检测。
+type ClientPayload struct {
+	ID         string `json:"id,omitempty"`
+	Security   string `json:"security,omitempty"`
+	Password   string `json:"password,omitempty"`
+	Flow       string `json:"flow,omitempty"`
+	Auth       string `json:"auth,omitempty"`
+	Email      string `json:"email"`
+	LimitIP    int    `json:"limitIp"`
+	TotalGB    int64  `json:"totalGB"`
+	ExpiryTime int64  `json:"expiryTime"`
+	Enable     bool   `json:"enable"`
+	SubID      string `json:"subId,omitempty"`
+	Reset      int    `json:"reset"`
 }
 
-// UpdateClientReq 是 POST /panel/api/inbounds/updateClient/:clientKey 的请求体。
+// BulkCreateItem 是 POST /panel/api/clients/bulkCreate 数组中的单项，
+// 对齐 3x-ui internal/web/service/client.go 的 ClientCreatePayload：
 //
-// :clientKey 由协议适配器决定（详见 protocol.Adapter.KeyOf 注释）：
+//	type ClientCreatePayload struct {
+//	    Client     model.Client `json:"client"`
+//	    InboundIds []int        `json:"inboundIds"`
+//	}
 //
-//	vless / vmess          → client.ID (UUID)
-//	trojan                 → client.password
-//	shadowsocks            → client.email
-//	hysteria / hysteria2   → client.auth
+// 一次 bulkCreate 调用接受 []BulkCreateItem，每个 Client 必须连同它要挂的
+// InboundIds 一起送上去——服务端按 InboundIds 逐 inbound 调 AddInboundClient。
+// bridge 每个 worker 只管一个 inbound，故 InboundIds 永远是单元素切片
+// []int{w.cfg.XuiInboundID}。
+type BulkCreateItem struct {
+	Client     ClientPayload `json:"client"`
+	InboundIds []int         `json:"inboundIds"`
+}
+
+// BulkCreateResult 是 POST /panel/api/clients/bulkCreate 成功响应 commonResp.obj
+// 的形态，对齐 3x-ui internal/web/service/client_bulk.go:937 BulkCreateResult：
 //
-// 调用方（xui.Client.UpdateClient）只负责把 KeyOf 输出做 url.PathEscape 后拼到 URL，
-// 不再做任何协议判断。
-type UpdateClientReq struct {
-	ID       int    `json:"id"`       // 目标 inbound id
-	Settings string `json:"settings"` // 单个 client 的 settings JSON（仅 clients 数组）
+//	type BulkCreateResult struct {
+//	    Created int                `json:"created"`
+//	    Skipped []BulkCreateReport `json:"skipped,omitempty"`
+//	}
+//
+// 关键陷阱：bulkCreate 即使有 client 失败（典型如 "email already in use"、
+// "subId already in use"、目标 inbound 不存在）也会在顶层返回 success=true；
+// 失败信息全部在 Skipped 里。xui.Client.AddClient 必须解码 obj 并把任何
+// Skipped 都视作错误，否则 sync 层会把"成功"baseline 写下去导致下周期 diff
+// 看不到该用户，永久不再尝试 add。
+type BulkCreateResult struct {
+	Created int                 `json:"created"`
+	Skipped []BulkCreateSkipped `json:"skipped,omitempty"`
+}
+
+// BulkCreateSkipped 是 3x-ui BulkCreateReport 的镜像；记录单个被跳过的
+// client 及其原因。
+type BulkCreateSkipped struct {
+	Email  string `json:"email"`
+	Reason string `json:"reason"`
 }
 
 // ClientSettings 是 inbound.settings.clients 数组中单个对象的中性表达。
@@ -131,8 +200,12 @@ type ClientSettings struct {
 	// Auth：hysteria / hysteria2 协议的鉴权字段。3x-ui 在 inbound.protocol
 	// 为 hysteria / hysteria2 时按 client.auth 查找，与 password 字段语义相互独立。
 	Auth string `json:"auth,omitempty"`
-	// Method：仅 shadowsocks per-user 模式有意义。
-	Method string `json:"method,omitempty"`
+	// Security：仅 shadowsocks per-user 模式有意义。3x-ui v3.3+ 把 client JSON
+	// 键由旧 "method" 改名为 "security"，bridge 字段一并跟进——既保证从
+	// inbound.settings.clients[] 解析现状时能读出值（v3.3+ 内的客户端会以
+	// "security" 落库），也保证 ClientPayload wire 形态一致。bridge 当前不
+	// 主动设置此字段，由服务端 fillProtocolDefaults 兜底。
+	Security string `json:"security,omitempty"`
 }
 
 // Error 是本包对外暴露的统一错误类型。

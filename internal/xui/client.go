@@ -425,49 +425,159 @@ func (c *Client) fetchInboundsCached(ctx context.Context) ([]Inbound, error) {
 	return inbounds, err
 }
 
-// AddClient 调用 POST /panel/api/inbounds/addClient 新增一个或多个 client。
+// AddClient 调用 POST /panel/api/clients/bulkCreate 批量新增 client。
 //
-// settingsJSON 是预先构造好的 inbound.settings 形态字符串（仅 clients 数组），
-// 由 protocol 适配器生成；本包不解析其字段，避免协议耦合。
-func (c *Client) AddClient(ctx context.Context, inboundID int, settingsJSON string) error {
-	body := AddClientReq{ID: inboundID, Settings: settingsJSON}
-	endpoint := "/panel/api/inbounds/addClient"
+// v3.3+ 路径：旧 /panel/api/inbounds/addClient 端点已被移除，新路径下 body
+// 不再是 inbound.settings JSON 字符串，而是数组形态——每项独立携带 client
+// 完整对象 + 它要挂载到的 inboundIds。bridge 每个 worker 只管一个 inbound，
+// 所以所有项的 InboundIds 都是 []int{inboundID}。
+//
+// 入参 clients 是 bridge 协议适配器产出的内部 ClientSettings 切片；本函数
+// 在序列化前把它们转成 wire 形态 ClientPayload，避免协议层与 wire 层耦合。
+//
+// 服务端 fillProtocolDefaults 会对 ID / Password / Auth 中的空字段按 inbound
+// protocol 自动补充随机值（详见 3x-ui client_crud.go:125-146），所以
+// trojan/shadowsocks/hysteria/hysteria2 这几类协议若 bridge 传 password/auth
+// 为空，服务端会替我们补；当前 bridge 协议适配器都已显式填好相应字段。
+//
+// 关键陷阱（v0.8.3 Codex 审核指出）：bulkCreate 即使有 client 失败
+// （典型如 "email already in use" / "subId already in use" / 目标 inbound
+// 不存在）也会在顶层返回 success=true；失败信息全部在 obj.skipped 数组里。
+// 本函数必须解码 obj 检查 Skipped 长度与 Created 计数——任何一个 skip 都
+// 立即上抛错误（含 email + 服务端给出的原因），否则 sync 层会按"成功"写
+// baseline 导致下周期 diff 看不到该用户、永久不再尝试 add（典型表现：少
+// 数用户在 Xboard 一直存在但 3x-ui 上始终缺位）。
+func (c *Client) AddClient(ctx context.Context, inboundID int, clients []ClientSettings) error {
+	if len(clients) == 0 {
+		return nil
+	}
+	body := make([]BulkCreateItem, 0, len(clients))
+	for _, s := range clients {
+		body = append(body, BulkCreateItem{
+			Client:     clientSettingsToPayload(s),
+			InboundIds: []int{inboundID},
+		})
+	}
+	endpoint := "/panel/api/clients/bulkCreate"
+	raw, err := c.do(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return err
+	}
+	// 顶层 success=true 不代表全部入库成功：解码 obj 检查 Skipped。
+	// obj 在所有 client 都成功时形态为 `{"created":N,"skipped":null}` 或
+	// 省略 skipped 字段；len(raw)==0 / "null" 视作"无 obj" 不安全——服务端
+	// 这条路径总是返回结构化 obj，缺失 obj 反而说明协议异常。
+	if len(raw) == 0 || string(raw) == "null" {
+		return fmt.Errorf("bulkCreate：响应 obj 为空，无法判定 created/skipped 状态（疑似 3x-ui 协议异常）")
+	}
+	var result BulkCreateResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("bulkCreate：解码 obj 失败：%w", err)
+	}
+	if len(result.Skipped) > 0 {
+		// 至少一项失败：拼成单行错误向上抛。把所有 skipped 都列出来，避免
+		// 多 client 批量场景下只看到第一个的运维盲区。
+		details := make([]string, 0, len(result.Skipped))
+		for _, sk := range result.Skipped {
+			details = append(details, fmt.Sprintf("%s=%s", sk.Email, sk.Reason))
+		}
+		return fmt.Errorf("bulkCreate：created=%d/%d，skipped %d 项 [%s]",
+			result.Created, len(clients), len(result.Skipped), strings.Join(details, "; "))
+	}
+	if result.Created != len(clients) {
+		// 防御性检查：理论上 len(Skipped)==0 时 Created 必然 == len(clients)；
+		// 若不等说明 3x-ui 内部统计逻辑异常，宁可报错让运维介入也别静默放过。
+		return fmt.Errorf("bulkCreate：created=%d 但请求了 %d，skipped 为空，疑似 3x-ui 统计异常",
+			result.Created, len(clients))
+	}
+	return nil
+}
+
+// UpdateClient 调用 POST /panel/api/clients/update/:email?inboundIds=<id>。
+//
+// v3.3+ 路径：旧 /panel/api/inbounds/updateClient/:clientKey 端点已被移除；
+// 新路径下 URL 主键统一为 email，body 直接是 ClientPayload（不再嵌
+// settings.clients[]）。inboundIds 通过 query 限定作用域——同一 email 若被
+// 关联到多个 inbound（多 bridge 共享 panel 场景下不会出现，但 3x-ui 支持
+// 跨 inbound 共享 client），bridge 应当只改自己管理的那条关联。
+func (c *Client) UpdateClient(ctx context.Context, inboundID int, client ClientSettings) error {
+	if client.Email == "" {
+		return fmt.Errorf("updateClient：client.Email 不能为空（新版 API 按 email 路由）")
+	}
+	endpoint := "/panel/api/clients/update/" + url.PathEscape(client.Email) +
+		"?inboundIds=" + url.QueryEscape(strconv.Itoa(inboundID))
+	body := clientSettingsToPayload(client)
 	if _, err := c.do(ctx, http.MethodPost, endpoint, body); err != nil {
 		return err
 	}
 	return nil
 }
 
-// UpdateClient 调用 POST /panel/api/inbounds/updateClient/:clientKey。
+// DelClientByEmail 调用 POST /panel/api/clients/del/:email 硬删除 client。
 //
-// clientKey 的取值由协议决定（详见 protocol.Adapter.KeyOf）：
+// v3.3+ 路径：旧 /panel/api/inbounds/:id/delClientByEmail/:email 端点已被移除；
+// 新版 /del/:email 删除范围是"该 email 对应的 ClientRecord + 关联的所有
+// inbound + traffic + IP 历史"，比旧版"仅从指定 inbound 移除"语义更宽。
 //
-//	vless / vmess           → client.id (UUID)
-//	trojan                  → client.password
-//	shadowsocks             → client.email
-//	hysteria / hysteria2    → client.auth
-func (c *Client) UpdateClient(ctx context.Context, clientKey string, inboundID int, settingsJSON string) error {
-	body := UpdateClientReq{ID: inboundID, Settings: settingsJSON}
-	endpoint := "/panel/api/inbounds/updateClient/" + url.PathEscape(clientKey)
-	if _, err := c.do(ctx, http.MethodPost, endpoint, body); err != nil {
-		return err
-	}
-	return nil
-}
-
-// DelClientByEmail 调用 POST /panel/api/inbounds/:id/delClientByEmail/:email
-// 按 email 删除客户端。即使该 email 已经不存在也返回 nil（幂等性由调用方保障）。
-func (c *Client) DelClientByEmail(ctx context.Context, inboundID int, email string) error {
-	endpoint := fmt.Sprintf("/panel/api/inbounds/%d/delClientByEmail/%s",
-		inboundID, url.PathEscape(email))
+// 签名变化（v0.8.3 起）：丢掉旧版的 inboundID 入参——新端点不按 inbound
+// 限定，把它留在签名里只会让调用方误以为还能控制作用域。调用方
+// （internal/sync/user_sync.go applyDelete）已同步更新。
+//
+// bridge 为何选硬删（/del）而不选按 inbound 解关联（/:email/detach）：
+//
+//	a) MakeEmail 生成的 email 含 node_id 后缀，跨 bridge 不冲突——单台
+//	   3x-ui 上不存在"同一 email 被多个 bridge 各自的 inbound 引用"的合
+//	   法场景；
+//	b) 选 detach 会留下孤儿 ClientRecord，下次同 UUID 的用户回来时
+//	   bulkCreate 会按 email 查到旧 ClientRecord 并检测 SubID 一致性失败
+//	   （client_crud.go:74-84），导致每周期重复 "email already in use"
+//	   错误；
+//	c) 硬删一并清掉 traffic / IP 历史与本 bridge 的"用户已离开本节点"
+//	   语义一致。
+//
+// 即使该 email 在 3x-ui 中已不存在，服务端会返回 success=false + msg=
+// "client not found in any inbound or client record"。当前实现把它作为
+// 错误向上传播——避免静默吞掉异常状态；同步 baseline 与 3x-ui 真实状态
+// 偏离时让运维一眼可见。
+func (c *Client) DelClientByEmail(ctx context.Context, email string) error {
+	endpoint := "/panel/api/clients/del/" + url.PathEscape(email)
 	if _, err := c.do(ctx, http.MethodPost, endpoint, nil); err != nil {
 		return err
 	}
 	return nil
 }
 
-// GetClientIPs 调用 POST /panel/api/inbounds/clientIps/:email，
+// clientSettingsToPayload 把 bridge 内部 ClientSettings 转成 v3.3+ wire 形态
+// ClientPayload。两者字段几乎一一对应，仅命名 Method→Security（v3.3 JSON 键
+// 改名）以及枚举 wire 必填字段而已。
+//
+// 拆出独立函数（而非让 ClientSettings 直接实现 MarshalJSON 自变形）：
+//
+//	a) 让 ClientSettings 保持纯数据语义、可被 diff 比较，避免 marshal 路径
+//	   引入 wire-version 选择副作用；
+//	b) 协议适配器层只需感知 ClientSettings；wire 转换内聚在 xui 包内。
+func clientSettingsToPayload(s ClientSettings) ClientPayload {
+	return ClientPayload{
+		ID:         s.ID,
+		Security:   s.Security,
+		Password:   s.Password,
+		Flow:       s.Flow,
+		Auth:       s.Auth,
+		Email:      s.Email,
+		LimitIP:    s.LimitIP,
+		TotalGB:    s.TotalGB,
+		ExpiryTime: s.ExpiryTime,
+		Enable:     s.Enable,
+		SubID:      s.SubID,
+		Reset:      s.Reset,
+	}
+}
+
+// GetClientIPs 调用 POST /panel/api/clients/ips/:email，
 // 返回字符串数组形态的 IP 历史（含时间戳）。
+//
+// v3.3+ 把端点从 /panel/api/inbounds/clientIps/:email 搬到
+// /panel/api/clients/ips/:email；响应形态与协议合法响应判定逻辑不变。
 //
 // 中间件主要用 GetOnlines() 拿在线 email，再拿 GetClientIPs 找该 email 当下使用的 IP。
 // 时间戳信息保留在原始字符串中（"1.2.3.4 (2024-01-02 15:04:05)"），调用方自行解析。
@@ -484,7 +594,7 @@ func (c *Client) DelClientByEmail(ctx context.Context, inboundID int, email stri
 // 这不是失败兜底，是"无数据 vs 协议异常"语义边界的显式拦截，避免静默
 // 把异常响应映射成空切片导致 alive_sync 少报用户。
 func (c *Client) GetClientIPs(ctx context.Context, email string) ([]string, error) {
-	endpoint := "/panel/api/inbounds/clientIps/" + url.PathEscape(email)
+	endpoint := "/panel/api/clients/ips/" + url.PathEscape(email)
 	raw, err := c.do(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -518,11 +628,13 @@ func (c *Client) GetClientIPs(ctx context.Context, email string) ([]string, erro
 	return nil, fmt.Errorf("解码 %s 响应：obj 既非数组也非 \"No IP Record\"：%s", endpoint, truncate(string(raw), 128))
 }
 
-// GetOnlines 调用 POST /panel/api/inbounds/onlines；返回当前在线的 email 列表。
+// GetOnlines 调用 POST /panel/api/clients/onlines；返回当前在线的 email 列表。
 //
 // 该数据是面板从本地 + 远程节点聚合得到，刷新周期约 10 秒。
+// v3.3+ 把端点从 /panel/api/inbounds/onlines 搬到 /panel/api/clients/onlines，
+// 响应形态不变（commonResp.obj 是 email 字符串数组）。
 func (c *Client) GetOnlines(ctx context.Context) ([]string, error) {
-	endpoint := "/panel/api/inbounds/onlines"
+	endpoint := "/panel/api/clients/onlines"
 	raw, err := c.do(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
 		return nil, err

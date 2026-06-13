@@ -247,14 +247,18 @@ func needsUpdate(ex, want xui.ClientSettings) bool {
 		ex.ExpiryTime != want.ExpiryTime ||
 		ex.TotalGB != want.TotalGB ||
 		ex.Reset != want.Reset ||
-		ex.Method != want.Method {
+		ex.Security != want.Security {
 		return true
 	}
 	return false
 }
 
 // applyAdd 把 toAdd 中所有 client 一次性追加到 inbound。
-// 3x-ui addClient 端点支持单次提交多个 client（settings.clients 是数组）。
+//
+// v3.3+ 起 xui.Client.AddClient 内部走 POST /panel/api/clients/bulkCreate，
+// body 是 []BulkCreateItem——每项独立携带 client + inboundIds（恒为本 worker
+// 管理的单一 inbound）。本函数把 map 拍成有序切片后直接把切片交给 xui 层
+// 封装 wire 形态，避免协议层与 wire 层耦合。
 func (w *bridgeWorker) applyAdd(ctx context.Context, toAdd map[string]xui.ClientSettings) error {
 	if len(toAdd) == 0 {
 		return nil
@@ -264,34 +268,30 @@ func (w *bridgeWorker) applyAdd(ctx context.Context, toAdd map[string]xui.Client
 	for _, c := range toAdd {
 		list = append(list, c)
 	}
-	settings, err := protocol.EncodeAddSettings(list)
-	if err != nil {
-		return err
-	}
-	if err := w.xuiC.AddClient(ctx, w.cfg.XuiInboundID, settings); err != nil {
+	if err := w.xuiC.AddClient(ctx, w.cfg.XuiInboundID, list); err != nil {
 		return fmt.Errorf("addClient：%w", err)
 	}
 	return nil
 }
 
 // applyUpdate 逐个对 toUpdate 中的 client 调 updateClient。
+//
+// v3.3+ 起 3x-ui updateClient URL 主键统一为 email，bridge 不再需要按协议
+// 推 KeyOf（旧版要按 vless/vmess 取 UUID、trojan 取 password、shadowsocks
+// 取 email、hysteria 取 auth；详见 v0.8.2 之前的 protocol.Adapter.KeyOf）。
 // 3x-ui 不支持批量更新，必须逐个调用。
 func (w *bridgeWorker) applyUpdate(ctx context.Context, toUpdate map[string]xui.ClientSettings) error {
 	if len(toUpdate) == 0 {
 		return nil
 	}
 	for email, c := range toUpdate {
-		key := w.adapter.KeyOf(c)
-		if key == "" {
-			// 协议适配器返回空 key 通常意味着字段缺失（如 trojan 缺 password）。
-			// 拒绝继续：这种 client 本就不该出现在 wanted 集合里。
-			return fmt.Errorf("updateClient：%s 的协议主键为空，请检查协议适配器输出", email)
+		if c.Email == "" {
+			// wanted 集合理论上每个 ClientSettings 都带 email（由
+			// buildWantedClients 通过 MakeEmail 显式填充）；空 email 说明
+			// 上游构造异常，直接报错让运维诊断。
+			return fmt.Errorf("updateClient %s：ClientSettings.Email 为空", email)
 		}
-		settings, err := protocol.EncodeSingleSettings(c)
-		if err != nil {
-			return err
-		}
-		if err := w.xuiC.UpdateClient(ctx, key, w.cfg.XuiInboundID, settings); err != nil {
+		if err := w.xuiC.UpdateClient(ctx, w.cfg.XuiInboundID, c); err != nil {
 			return fmt.Errorf("updateClient %s：%w", email, err)
 		}
 	}
@@ -300,13 +300,21 @@ func (w *bridgeWorker) applyUpdate(ctx context.Context, toUpdate map[string]xui.
 
 // applyDelete 逐个调 delClientByEmail。
 //
-// 即使 email 已不存在 3x-ui 仍返回 success=true（幂等），所以不需要额外的"先查再删"。
+// v3.3+ 起 xui.Client.DelClientByEmail 内部走 POST /panel/api/clients/del/:email
+// （硬删），即一并清掉 ClientRecord + traffic + IP 历史。详见 xui.Client
+// DelClientByEmail 注释中为何选硬删而非 /:email/detach 的权衡。
+//
+// 与旧版差异：若 email 已不存在，旧端点（/panel/api/inbounds/:id/delClientByEmail
+// /:email）仍返回 success=true（幂等）；新端点会返回 success=false + msg=
+// "client not found in any inbound or client record"，本函数原样向上传播。
+// baseline 与 3x-ui 真实状态偏离时（例如运维在面板侧手动删过该 email）会立
+// 即可见，由 supervisor 层 WARN 日志显式告警，避免静默吞掉异常。
 func (w *bridgeWorker) applyDelete(ctx context.Context, toDelete map[string]struct{}) error {
 	if len(toDelete) == 0 {
 		return nil
 	}
 	for email := range toDelete {
-		if err := w.xuiC.DelClientByEmail(ctx, w.cfg.XuiInboundID, email); err != nil {
+		if err := w.xuiC.DelClientByEmail(ctx, email); err != nil {
 			return fmt.Errorf("delClientByEmail %s：%w", email, err)
 		}
 	}

@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
@@ -14,26 +13,17 @@ import (
 // 每个协议实现一个 Adapter；同步引擎根据 Bridge.Protocol 通过 For() 取得对应实例。
 //
 // 接口故意保持极小——只要双方互相理解 ClientSettings，加协议无需改动接口。
+//
+// 历史：v0.8.2 之前接口还含 KeyOf（为旧端点
+// POST /panel/api/inbounds/updateClient/:clientKey 提取主键），但 3x-ui v3.3+
+// 把所有 client 增删改端点搬到 /panel/api/clients/* 且 URL 主键统一为 email，
+// clientKey 概念消失——故 v0.8.3 起 Adapter 不再需要 KeyOf。
 type Adapter interface {
 	// Protocol 返回适配器所对应的协议名（小写、与 config.ProtocolXxx 一致）。
 	Protocol() string
 
 	// BuildClient 把 Xboard 用户转换为可写入 3x-ui inbound.settings.clients[i] 的对象。
 	BuildClient(user xboard.User, bridge config.Bridge) xui.ClientSettings
-
-	// KeyOf 提取一个 client 的"主键"，用于 POST /panel/api/inbounds/updateClient/:key 路径。
-	//
-	// 与 3x-ui 后端 controller/inbound.go updateInboundClient 的查找逻辑严格对齐：
-	//
-	//   vless / vmess           返回 client.ID（UUID）
-	//   trojan                  返回 client.Password
-	//   shadowsocks             返回 client.Email   （注意：不是 password）
-	//   hysteria / hysteria2    返回 client.Auth    （注意：不是 password）
-	//
-	// 任何协议适配器若返回错误的字段，updateClient 都会找不到目标 client，
-	// 静默退化为"修改未生效"——这是难以排查的 bug 源，故有必要在接口注释中
-	// 明确声明每种协议的真相源。
-	KeyOf(client xui.ClientSettings) string
 }
 
 // For 按协议名取适配器；未实现的协议返回非 nil error。
@@ -57,37 +47,6 @@ func For(protocol string) (Adapter, error) {
 	default:
 		return nil, fmt.Errorf("protocol: 暂不支持 %q 协议", protocol)
 	}
-}
-
-// EncodeAddSettings 把一组 client 包装成 inbound.settings 形态的 JSON 字符串。
-//
-// 用于 POST /panel/api/inbounds/addClient 的 settings 字段。3x-ui 后端会
-// 把这里的 clients 数组追加到 inbound 现有 clients。
-//
-// 各协议的 settings 顶层除 clients 外还有少数协议级字段（vless 的 decryption、
-// vmess 的 default、shadowsocks 的 method 等），但 addClient 路径下后端只读
-// clients 字段，其他字段缺失也不会报错——这是 3x-ui controller/inbound.go 的实现细节。
-func EncodeAddSettings(clients []xui.ClientSettings) (string, error) {
-	envelope := map[string]any{"clients": clients}
-	buf, err := json.Marshal(envelope)
-	if err != nil {
-		return "", fmt.Errorf("EncodeAddSettings 序列化：%w", err)
-	}
-	return string(buf), nil
-}
-
-// EncodeSingleSettings 与 EncodeAddSettings 一样，但只包一个 client，
-// 用于 POST /panel/api/inbounds/updateClient/:key 的 settings 字段。
-//
-// 抽出独立函数：让调用点的语义更明确（"我在更新一个" vs "我在追加多个"），
-// 减少误用——后端对单 client 与多 client 的写入路径并不同。
-func EncodeSingleSettings(client xui.ClientSettings) (string, error) {
-	envelope := map[string]any{"clients": []xui.ClientSettings{client}}
-	buf, err := json.Marshal(envelope)
-	if err != nil {
-		return "", fmt.Errorf("EncodeSingleSettings 序列化：%w", err)
-	}
-	return string(buf), nil
 }
 
 // totalGBFromTransfer 把 Xboard 用户的"剩余流量"概念映射为 3x-ui 的 totalGB。

@@ -13,17 +13,11 @@ import (
 //   - 适配器结构体名 = <协议>Adapter（lowerCamel；包外不需要直接构造，通过 For() 取）。
 //   - 字段填充顺序与 ClientSettings 字段声明顺序一致，便于 diff 比较。
 //   - 不在 BuildClient 内做 IO，纯函数。
-//   - KeyOf 仅读取 ClientSettings，绝不依赖外部状态——若依赖会破坏单元测试可重放性。
 //
-// KeyOf 的语义：
-//
-//	返回值用于拼接 POST /panel/api/inbounds/updateClient/:clientKey 的 URL 参数。
-//	3x-ui 后端按 inbound.protocol 不同，用不同字段在 settings.clients 中查找：
-//	  vless / vmess              按 client.id (UUID)
-//	  trojan                     按 client.password
-//	  shadowsocks                按 client.email（注意：不是 password！）
-//	  hysteria / hysteria2       按 client.auth
-//	因此各协议适配器必须返回与之匹配的字段。
+// v0.8.3 起 Adapter 不再需要 KeyOf：3x-ui v3.3+ 把所有 client 增删改端点搬
+// 到 /panel/api/clients/* 且 URL 主键统一为 email，原"按协议返回 uuid/
+// password/email/auth"的分支判定彻底失效。详见 internal/protocol/adapter.go
+// 与 internal/xui/client.go UpdateClient 注释。
 //
 // 共同填充字段：
 //   Email      由 MakeEmail(uuid, node_id) 生成，跨协议一致。
@@ -51,8 +45,6 @@ func (vlessAdapter) BuildClient(user xboard.User, bridge config.Bridge) xui.Clie
 	}
 }
 
-func (vlessAdapter) KeyOf(client xui.ClientSettings) string { return client.ID }
-
 // vmessAdapter 适配 VMess 协议。
 //
 // 注意：3x-ui 不在 client 上单独存 alterId，alterId 在 inbound.settings.default 中。
@@ -72,8 +64,6 @@ func (vmessAdapter) BuildClient(user xboard.User, bridge config.Bridge) xui.Clie
 	}
 }
 
-func (vmessAdapter) KeyOf(client xui.ClientSettings) string { return client.ID }
-
 // trojanAdapter 适配 Trojan 协议。
 //
 // 3x-ui trojan client 关键字段是 password；中间件直接把 uuid 当作 password 使用。
@@ -92,13 +82,7 @@ func (trojanAdapter) BuildClient(user xboard.User, bridge config.Bridge) xui.Cli
 	}
 }
 
-func (trojanAdapter) KeyOf(client xui.ClientSettings) string { return client.Password }
-
 // shadowsocksAdapter 适配 Shadowsocks 协议。
-//
-// 关键差异：3x-ui 对 SS client 的更新查找以 email 为主键（详见
-// web/controller/inbound.go updateInboundClient 与 SS client model）。
-// 因此 KeyOf 必须返回 email，而非 password；这一点与 Trojan / Hysteria 不同。
 //
 // 兼容性边界：
 //
@@ -121,12 +105,10 @@ func (shadowsocksAdapter) BuildClient(user xboard.User, bridge config.Bridge) xu
 	}
 }
 
-func (shadowsocksAdapter) KeyOf(client xui.ClientSettings) string { return client.Email }
-
 // hysteriaV1Adapter 适配 Hysteria v1 协议（3x-ui 端 protocol="hysteria"）。
 //
 // Hysteria v1 客户端配置使用 auth_str（即 client.auth）字段；与 Trojan / SS 不同，
-// 这里的密码不写在 password 字段里。3x-ui updateClient 端按 client.auth 查找。
+// 这里的密码不写在 password 字段里。
 type hysteriaV1Adapter struct{}
 
 func (hysteriaV1Adapter) Protocol() string { return config.ProtocolHysteria }
@@ -141,8 +123,6 @@ func (hysteriaV1Adapter) BuildClient(user xboard.User, bridge config.Bridge) xui
 		LimitIP:    user.DeviceLimit,
 	}
 }
-
-func (hysteriaV1Adapter) KeyOf(client xui.ClientSettings) string { return client.Auth }
 
 // hysteriaV2Adapter 适配 Hysteria v2 协议（3x-ui 端 protocol="hysteria2"）。
 //
@@ -163,4 +143,3 @@ func (hysteriaV2Adapter) BuildClient(user xboard.User, bridge config.Bridge) xui
 	}
 }
 
-func (hysteriaV2Adapter) KeyOf(client xui.ClientSettings) string { return client.Auth }
