@@ -127,12 +127,13 @@ release:
 
 ## web: 构建 Vue 3 前端并把 dist 同步到 internal/web/dist 让 go:embed 打入二进制
 ##
-## 先 npm install（含 dev 依赖）→ npm run build 输出到 web/dist →
-## rm -rf internal/web/dist + cp 全量覆盖。注意：本目标不增量——每次都
-## 重建并全量覆盖，保证 dist 永远反映最新前端代码。
+## 先 npm ci（严格按 package-lock.json 安装，CI / 本地依赖树一致、构建可
+## 复现）→ npm run build 输出到 web/dist → rm -rf internal/web/dist + cp
+## 全量覆盖。注意：本目标不增量——每次都重建并全量覆盖，保证 dist 永远
+## 反映最新前端代码。
 .PHONY: web
 web:
-	cd $(WEB_DIR) && $(NPM) install --include=dev
+	cd $(WEB_DIR) && $(NPM) ci
 	cd $(WEB_DIR) && $(NPM) run build
 	rm -rf $(EMBED_DIR)
 	mkdir -p $(EMBED_DIR)

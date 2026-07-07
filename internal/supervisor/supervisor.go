@@ -260,6 +260,8 @@ func (s *Supervisor) Snapshot() *config.Root {
 	snap := *s.cfg
 	snap.Bridges = make([]config.Bridge, len(s.cfg.Bridges))
 	copy(snap.Bridges, s.cfg.Bridges)
+	snap.XuiPanels = make([]config.XuiPanel, len(s.cfg.XuiPanels))
+	copy(snap.XuiPanels, s.cfg.XuiPanels)
 	return &snap
 }
 
@@ -296,11 +298,30 @@ func (s *Supervisor) buildEngine(cfg *config.Root) (*syncengine.Engine, error) {
 	// 各自追加 module=xui / module=sync；若传入已带 module=supervisor 的
 	// s.log，会让 JSON 输出出现两个 module 键。详见 Supervisor 字段注释
 	// 中"rootLog"段落（v0.8.4 Codex 审查闭环）。
-	xuiC, err := xui.New(cfg.Xui, s.rootLog)
-	if err != nil {
-		return nil, fmt.Errorf("初始化 3x-ui 客户端：%w", err)
+	//
+	// fork 多面板扩展：每个面板一个 xui.Client（连接复用发生在同面板的
+	// 多个 bridge 之间）。仅为"被 enabled bridge 实际引用"的面板构造
+	// 客户端——未被引用的面板不产生任何网络对象。
+	referenced := make(map[string]struct{}, len(cfg.XuiPanels))
+	for _, b := range cfg.Bridges {
+		if b.Enable {
+			referenced[b.XuiPanel] = struct{}{}
+		}
 	}
-	eng, err := syncengine.New(cfg, s.rootLog, xboardC, xuiC, s.store)
+	xuiClients := make(map[string]*xui.Client, len(referenced))
+	for name := range referenced {
+		p, ok := cfg.FindXuiPanel(name)
+		if !ok {
+			// Validate 已保证引用存在；此分支仅防御未来改动破坏该不变量。
+			return nil, fmt.Errorf("bridge 引用的面板 %q 不存在（配置校验不变量被破坏）", name)
+		}
+		c, err := xui.New(p.Xui, s.rootLog)
+		if err != nil {
+			return nil, fmt.Errorf("初始化 3x-ui 客户端（面板 %s）：%w", name, err)
+		}
+		xuiClients[name] = c
+	}
+	eng, err := syncengine.New(cfg, s.rootLog, xboardC, xuiClients, s.store)
 	if err != nil {
 		return nil, fmt.Errorf("装配同步引擎：%w", err)
 	}
@@ -346,33 +367,68 @@ func (s *Supervisor) startEngineLocked(eng *syncengine.Engine) {
 // 用法是：cfg 来自 LoadFromStore（独立 *Root 实例），原地修改不会污染
 // 持久层，调用方下次 LoadFromStore 仍能拿到 store 里的真实 bridges。
 func applyCredsGuard(cfg *config.Root, log *slog.Logger) bool {
-	// 委托给 cfg.{Xboard,Xui}.CredsComplete()——同一份函数在
-	// internal/web/status_handler.go 也使用，杜绝运维看到的"凭据完整性"灯
-	// 与引擎实际行为不一致。v0.6 起 xui 仅 Bearer API Token 单通道，
-	// CredsComplete 检查 APIHost + APIToken 两必填。
-	xboardOK := cfg.Xboard.CredsComplete()
-	xuiOK := cfg.Xui.CredsComplete()
-	if xboardOK && xuiOK {
-		return false
+	// 委托给 cfg.Xboard.CredsComplete() 与各面板的 CredsComplete()——
+	// internal/web/status_handler.go 使用同一组函数，杜绝运维看到的
+	// "凭据完整性"灯与引擎实际行为不一致。
+	//
+	// fork 多面板扩展后的护栏语义（从"全清空"细化为"按面板过滤"）：
+	//
+	//	a) Xboard 凭据不全 → 所有 bridge 都发不出上报，仍然全清空；
+	//	b) Xboard 凭据齐但某面板凭据不全 → 仅禁用引用该面板的 bridge，
+	//	   其余面板的 bridge 照常运行——单面板半填不再拖累全局。
+	if !cfg.Xboard.CredsComplete() {
+		enabledCount := 0
+		for _, b := range cfg.Bridges {
+			if b.Enable {
+				enabledCount++
+			}
+		}
+		if enabledCount == 0 {
+			return false
+		}
+		log.Warn("启用的 Bridge 存在但 Xboard 凭据未完整配置，引擎将以空载模式启动",
+			"event", "creds_guard_triggered",
+			"enabled_bridge_count", enabledCount,
+			"xboard_creds_ok", false,
+			"hint", "在 Web 面板补齐 Xboard 凭据并保存配置以恢复正常工作",
+		)
+		cfg.Bridges = nil
+		return true
 	}
-	enabledCount := 0
-	for _, b := range cfg.Bridges {
-		if b.Enable {
-			enabledCount++
+
+	// Xboard 凭据齐；逐面板检查，过滤掉引用了"凭据不全面板"的 enabled bridge。
+	badPanels := make(map[string]struct{})
+	for _, p := range cfg.XuiPanels {
+		if !p.CredsComplete() {
+			badPanels[p.Name] = struct{}{}
 		}
 	}
-	if enabledCount == 0 {
-		// 没有 enabled bridge：worker 数本来就是 0，无须清空。
+	if len(badPanels) == 0 {
 		return false
 	}
-	log.Warn("启用的 Bridge 存在但凭据未完整配置，引擎将以空载模式启动",
+	kept := cfg.Bridges[:0]
+	guardedCount := 0
+	for _, b := range cfg.Bridges {
+		if _, bad := badPanels[b.XuiPanel]; bad && b.Enable {
+			guardedCount++
+			continue
+		}
+		kept = append(kept, b)
+	}
+	if guardedCount == 0 {
+		return false
+	}
+	badNames := make([]string, 0, len(badPanels))
+	for name := range badPanels {
+		badNames = append(badNames, name)
+	}
+	log.Warn("部分 3x-ui 面板凭据未完整配置，引用它们的 Bridge 已被临时禁用",
 		"event", "creds_guard_triggered",
-		"enabled_bridge_count", enabledCount,
-		"xboard_creds_ok", xboardOK,
-		"xui_creds_ok", xuiOK,
-		"hint", "在 Web 面板补齐凭据并保存配置以恢复正常工作",
+		"guarded_bridge_count", guardedCount,
+		"incomplete_panels", badNames,
+		"hint", "在 Web 面板补齐对应面板的 api_host / api_token 后保存即可恢复",
 	)
-	cfg.Bridges = nil
+	cfg.Bridges = kept
 	return true
 }
 

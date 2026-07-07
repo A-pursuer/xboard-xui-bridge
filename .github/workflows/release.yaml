@@ -1,11 +1,11 @@
-# Release 构建流水线（fork 供应链固化）。
+# Release 构建流水线（fork 供应链固化 + 多面板扩展）。
 #
-# 触发：推送 v* 标签（例如 v0.8.4-fork.1）。
+# 触发：推送 v* 标签（例如 v0.9.0-fork.1）。
 #
 # 设计要点：
-#   1) 不执行 `make web`——前端产物 internal/web/dist/ 已提交入仓，
-#      直接复用可以避免 CI 期间从 npm registry 引入未经审计的新依赖，
-#      保证 Release 二进制 == 仓库中已审计源码的确定性产物。
+#   1) `make web` 在 CI 内重建前端：npm ci 严格按已提交的 package-lock.json
+#      安装依赖（锁定版本 + integrity 哈希校验），构建可复现；产出经
+#      go:embed 打入二进制。
 #   2) 复用 Makefile 的 build-* / release-tars 目标：产出
 #      xboard-xui-bridge-{linux-amd64,linux-arm64,linux-arm}.tar.gz
 #      + SHA256SUMS.txt，与 install.sh 的下载/校验约定完全匹配。
@@ -28,12 +28,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
 
-      - name: Build binaries (reuse committed web dist)
+      - name: Build web frontend (npm ci, lockfile-pinned)
+        run: make web
+
+      - name: Build binaries
         run: make build-linux build-arm64 build-arm VERSION=${{ github.ref_name }}
 
       - name: Package tarballs + SHA256SUMS.txt

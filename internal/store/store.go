@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,12 +96,31 @@ type BridgeRow struct {
 	Name           string
 	XboardNodeID   int
 	XboardNodeType string
-	XuiInboundID   int
-	Protocol       string
-	Flow           string
-	Enable         bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// XuiPanel 引用 xui_panels.name；空串仅出现在旧库迁移前的瞬间，
+	// runLegacyXuiMigration 会把它回填为 'default'。
+	XuiPanel     string
+	XuiInboundID int
+	Protocol     string
+	Flow         string
+	Enable       bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// XuiPanelRow 是 xui_panels 表的行 DTO（fork 多面板扩展）。
+//
+// 字段语义与 config.Xui 一一对应；Name 是主键，被 bridges.xui_panel 引用。
+// APIToken 明文存储——敏感度与 settings 表内的 xboard.token 相同，由
+// bridge.db 的 0600 文件权限兜底（详见 hardenSQLiteFilePerms）。
+type XuiPanelRow struct {
+	Name          string
+	APIHost       string
+	BasePath      string
+	APIToken      string
+	TimeoutSec    int
+	SkipTLSVerify bool
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // AdminUserRow 是 admin_users 表的行 DTO。
@@ -248,6 +268,30 @@ type Store interface {
 	// （即 reload 已让旧 worker 退出）。详见 DeleteBridge 注释中"正确的
 	// 删除流程"。
 	DeleteBaselinesByBridge(ctx context.Context, bridgeName string) (int64, error)
+
+	// ============ xui_panels（fork 多面板扩展）============
+
+	// ListXuiPanels 列出所有 3x-ui 面板配置，按 name 升序。
+	ListXuiPanels(ctx context.Context) ([]XuiPanelRow, error)
+
+	// GetXuiPanel 按 name 主键读取；不存在返回 ErrNotFound。
+	GetXuiPanel(ctx context.Context, name string) (XuiPanelRow, error)
+
+	// CreateXuiPanel 写入新面板；name 已存在返回 ErrAlreadyExists 包装错误。
+	// CreatedAt / UpdatedAt 自动填入当前时间。
+	CreateXuiPanel(ctx context.Context, p XuiPanelRow) error
+
+	// UpdateXuiPanel 按 name 更新所有字段；不存在返回 ErrNotFound。
+	UpdateXuiPanel(ctx context.Context, p XuiPanelRow) error
+
+	// DeleteXuiPanel 按 name 删除；幂等。调用方须先用 CountBridgesByPanel
+	// 确认无 bridge 引用（本方法不做级联校验，与 DeleteBridge 的
+	// baseline 清理约定风格一致：由业务层显式编排）。
+	DeleteXuiPanel(ctx context.Context, name string) error
+
+	// CountBridgesByPanel 统计引用指定面板的 bridges 行数，供删除面板前
+	// 的引用校验使用。
+	CountBridgesByPanel(ctx context.Context, panelName string) (int, error)
 
 	// ============ admin_users ============
 
@@ -463,6 +507,8 @@ var migrationStmts = []string{
 	"ALTER TABLE traffic_baseline ADD COLUMN last_seen_down INTEGER NOT NULL DEFAULT 0",
 	"ALTER TABLE traffic_baseline ADD COLUMN pending_up     INTEGER NOT NULL DEFAULT 0",
 	"ALTER TABLE traffic_baseline ADD COLUMN pending_down   INTEGER NOT NULL DEFAULT 0",
+	// fork 多面板扩展：bridges 增加 xui_panel 引用列（xui_panels.name）。
+	"ALTER TABLE bridges ADD COLUMN xui_panel TEXT NOT NULL DEFAULT ''",
 }
 
 // runMigrations 顺序执行 migrationStmts。
@@ -479,6 +525,110 @@ func runMigrations(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("执行 %q：%w", stmt, err)
 		}
 	}
+	return runLegacyXuiMigration(ctx, db)
+}
+
+// legacyDefaultPanelName 是旧"xui 单例配置"迁移后的面板名。
+//
+// 选 "default" 而非空串：面板名参与日志与 Web 下拉展示，空串会让运维误
+// 以为"没配面板"；同时它也是 bridges.xui_panel 空值回填的目标，让存量
+// 桥接升级后立刻可跑。
+const legacyDefaultPanelName = "default"
+
+// runLegacyXuiMigration 把 settings 表中残留的 xui.* 单例配置一次性迁移为
+// xui_panels 表中名为 'default' 的面板行。
+//
+// 触发条件（全部满足才执行，保证幂等）：
+//
+//	a) xui_panels 表为空——已有任何面板行说明迁移早已完成或运维手工建过；
+//	b) settings 中 xui.api_host 存在且非空——半填/未填的旧配置没有迁移价值，
+//	   直接跳过（新面板由运维在 Web 面板上重新创建）。
+//
+// 迁移动作（单事务，任一步失败整体回滚）：
+//
+//	1) INSERT xui_panels('default', <legacy 值>)；
+//	2) UPDATE bridges SET xui_panel='default' WHERE TRIM(xui_panel)=''——
+//	   存量桥接全部指向迁移面板，升级后行为与旧版完全一致；
+//	3) DELETE settings 中全部 xui.* 键——避免"两处真相源"心智负担；
+//	   v0.4/v0.5 残留的 xui.username / xui.password 等也一并清掉。
+func runLegacyXuiMigration(ctx context.Context, db *sql.DB) error {
+	var panelCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM xui_panels;`).Scan(&panelCount); err != nil {
+		return fmt.Errorf("统计 xui_panels：%w", err)
+	}
+	if panelCount > 0 {
+		return nil
+	}
+
+	settings := map[string]string{}
+	rows, err := db.QueryContext(ctx, `SELECT key, value FROM settings WHERE key LIKE 'xui.%';`)
+	if err != nil {
+		return fmt.Errorf("读取旧 xui.* settings：%w", err)
+	}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("扫描旧 xui.* settings：%w", err)
+		}
+		settings[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("遍历旧 xui.* settings：%w", err)
+	}
+	_ = rows.Close()
+
+	apiHost := strings.TrimSpace(settings["xui.api_host"])
+	if apiHost == "" {
+		// 无有效旧配置；不迁移。旧库中可能残留的 xui.* 半填键不动——
+		// LoadFromStore 已不再读取它们，无害。
+		return nil
+	}
+
+	timeoutSec := 0
+	if raw := strings.TrimSpace(settings["xui.timeout_sec"]); raw != "" {
+		if n, perr := strconv.Atoi(raw); perr == nil {
+			timeoutSec = n
+		}
+	}
+	skipTLS := 0
+	if raw := strings.TrimSpace(settings["xui.skip_tls_verify"]); raw != "" {
+		if b, perr := strconv.ParseBool(raw); perr == nil && b {
+			skipTLS = 1
+		}
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启迁移事务：%w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO xui_panels (name, api_host, base_path, api_token, timeout_sec, skip_tls_verify, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+		legacyDefaultPanelName, apiHost,
+		strings.TrimSpace(settings["xui.base_path"]),
+		strings.TrimSpace(settings["xui.api_token"]),
+		timeoutSec, skipTLS, now, now,
+	); err != nil {
+		return fmt.Errorf("写入迁移面板：%w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE bridges SET xui_panel = ?, updated_at = ? WHERE TRIM(xui_panel) = '';`,
+		legacyDefaultPanelName, now,
+	); err != nil {
+		return fmt.Errorf("回填 bridges.xui_panel：%w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key LIKE 'xui.%';`); err != nil {
+		return fmt.Errorf("清理旧 xui.* settings：%w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交迁移事务：%w", err)
+	}
+	fmt.Fprintf(os.Stderr, "[info] 已将旧 xui 单例配置迁移为面板 %q（多面板扩展）\n", legacyDefaultPanelName)
 	return nil
 }
 
@@ -839,7 +989,7 @@ func (s *sqliteStore) DeleteSetting(ctx context.Context, key string) error {
 // ListBridges 实现 Store 接口。
 func (s *sqliteStore) ListBridges(ctx context.Context) ([]BridgeRow, error) {
 	const q = `
-SELECT name, xboard_node_id, xboard_node_type, xui_inbound_id,
+SELECT name, xboard_node_id, xboard_node_type, xui_panel, xui_inbound_id,
        protocol, flow, enable, created_at, updated_at
 FROM bridges
 ORDER BY name ASC;
@@ -867,7 +1017,7 @@ ORDER BY name ASC;
 // GetBridge 实现 Store 接口。
 func (s *sqliteStore) GetBridge(ctx context.Context, name string) (BridgeRow, error) {
 	const q = `
-SELECT name, xboard_node_id, xboard_node_type, xui_inbound_id,
+SELECT name, xboard_node_id, xboard_node_type, xui_panel, xui_inbound_id,
        protocol, flow, enable, created_at, updated_at
 FROM bridges
 WHERE name = ?;
@@ -898,12 +1048,12 @@ func (s *sqliteStore) CreateBridge(ctx context.Context, b BridgeRow) error {
 	}
 	now := time.Now().Unix()
 	const stmt = `
-INSERT INTO bridges (name, xboard_node_id, xboard_node_type, xui_inbound_id,
+INSERT INTO bridges (name, xboard_node_id, xboard_node_type, xui_panel, xui_inbound_id,
     protocol, flow, enable, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `
 	if _, err := s.db.ExecContext(ctx, stmt,
-		b.Name, b.XboardNodeID, b.XboardNodeType, b.XuiInboundID,
+		b.Name, b.XboardNodeID, b.XboardNodeType, b.XuiPanel, b.XuiInboundID,
 		b.Protocol, b.Flow, boolToInt(b.Enable), now, now,
 	); err != nil {
 		if isUniqueConstraintError(err) {
@@ -934,6 +1084,7 @@ func (s *sqliteStore) UpdateBridge(ctx context.Context, b BridgeRow) error {
 UPDATE bridges SET
     xboard_node_id   = ?,
     xboard_node_type = ?,
+    xui_panel        = ?,
     xui_inbound_id   = ?,
     protocol         = ?,
     flow             = ?,
@@ -942,7 +1093,7 @@ UPDATE bridges SET
 WHERE name = ?;
 `
 	res, err := s.db.ExecContext(ctx, stmt,
-		b.XboardNodeID, b.XboardNodeType, b.XuiInboundID,
+		b.XboardNodeID, b.XboardNodeType, b.XuiPanel, b.XuiInboundID,
 		b.Protocol, b.Flow, boolToInt(b.Enable),
 		now, b.Name,
 	)
@@ -979,6 +1130,151 @@ func (s *sqliteStore) DeleteBaselinesByBridge(ctx context.Context, bridgeName st
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("DeleteBaselinesByBridge %q 取受影响行数：%w", bridgeName, err)
+	}
+	return n, nil
+}
+
+// ============================================================================
+// xui_panels 实现（fork 多面板扩展）
+// ============================================================================
+
+// scanXuiPanel 把一行 xui_panels 扫描为 XuiPanelRow；列顺序与所有查询保持一致。
+func scanXuiPanel(scan func(...any) error) (XuiPanelRow, error) {
+	var (
+		p                        XuiPanelRow
+		skipTLSInt               int64
+		createdAtTS, updatedAtTS int64
+	)
+	err := scan(
+		&p.Name, &p.APIHost, &p.BasePath, &p.APIToken,
+		&p.TimeoutSec, &skipTLSInt,
+		&createdAtTS, &updatedAtTS,
+	)
+	if err != nil {
+		return XuiPanelRow{}, err
+	}
+	p.SkipTLSVerify = skipTLSInt != 0
+	p.CreatedAt = unixToTime(createdAtTS)
+	p.UpdatedAt = unixToTime(updatedAtTS)
+	return p, nil
+}
+
+// ListXuiPanels 实现 Store 接口。
+func (s *sqliteStore) ListXuiPanels(ctx context.Context) ([]XuiPanelRow, error) {
+	const q = `
+SELECT name, api_host, base_path, api_token, timeout_sec, skip_tls_verify,
+       created_at, updated_at
+FROM xui_panels
+ORDER BY name ASC;
+`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("ListXuiPanels 查询：%w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []XuiPanelRow
+	for rows.Next() {
+		p, err := scanXuiPanel(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListXuiPanels 遍历：%w", err)
+	}
+	return out, nil
+}
+
+// GetXuiPanel 实现 Store 接口。
+func (s *sqliteStore) GetXuiPanel(ctx context.Context, name string) (XuiPanelRow, error) {
+	const q = `
+SELECT name, api_host, base_path, api_token, timeout_sec, skip_tls_verify,
+       created_at, updated_at
+FROM xui_panels
+WHERE name = ?;
+`
+	row := s.db.QueryRowContext(ctx, q, name)
+	p, err := scanXuiPanel(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return XuiPanelRow{}, ErrNotFound
+	}
+	return p, err
+}
+
+// CreateXuiPanel 实现 Store 接口。
+func (s *sqliteStore) CreateXuiPanel(ctx context.Context, p XuiPanelRow) error {
+	if strings.TrimSpace(p.Name) == "" {
+		return errors.New("CreateXuiPanel: name 不可为空")
+	}
+	now := time.Now().Unix()
+	const stmt = `
+INSERT INTO xui_panels (name, api_host, base_path, api_token, timeout_sec, skip_tls_verify,
+    created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+`
+	if _, err := s.db.ExecContext(ctx, stmt,
+		p.Name, p.APIHost, p.BasePath, p.APIToken,
+		p.TimeoutSec, boolToInt(p.SkipTLSVerify), now, now,
+	); err != nil {
+		if isUniqueConstraintError(err) {
+			return fmt.Errorf("CreateXuiPanel %q：%w", p.Name, ErrAlreadyExists)
+		}
+		return fmt.Errorf("CreateXuiPanel %q：%w", p.Name, err)
+	}
+	return nil
+}
+
+// UpdateXuiPanel 实现 Store 接口。
+func (s *sqliteStore) UpdateXuiPanel(ctx context.Context, p XuiPanelRow) error {
+	if strings.TrimSpace(p.Name) == "" {
+		return errors.New("UpdateXuiPanel: name 不可为空")
+	}
+	now := time.Now().Unix()
+	const stmt = `
+UPDATE xui_panels SET
+    api_host        = ?,
+    base_path       = ?,
+    api_token       = ?,
+    timeout_sec     = ?,
+    skip_tls_verify = ?,
+    updated_at      = ?
+WHERE name = ?;
+`
+	res, err := s.db.ExecContext(ctx, stmt,
+		p.APIHost, p.BasePath, p.APIToken,
+		p.TimeoutSec, boolToInt(p.SkipTLSVerify),
+		now, p.Name,
+	)
+	if err != nil {
+		return fmt.Errorf("UpdateXuiPanel %q：%w", p.Name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("UpdateXuiPanel %q 取受影响行数：%w", p.Name, err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteXuiPanel 实现 Store 接口；幂等。
+func (s *sqliteStore) DeleteXuiPanel(ctx context.Context, name string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM xui_panels WHERE name = ?;`, name); err != nil {
+		return fmt.Errorf("DeleteXuiPanel %q：%w", name, err)
+	}
+	return nil
+}
+
+// CountBridgesByPanel 实现 Store 接口。
+func (s *sqliteStore) CountBridgesByPanel(ctx context.Context, panelName string) (int, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM bridges WHERE xui_panel = ?;`, panelName,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountBridgesByPanel %q：%w", panelName, err)
 	}
 	return n, nil
 }
@@ -1337,7 +1633,7 @@ func scanBridge(scan func(...any) error) (BridgeRow, error) {
 		createdAtTS, updatedAtTS int64
 	)
 	err := scan(
-		&b.Name, &b.XboardNodeID, &b.XboardNodeType, &b.XuiInboundID,
+		&b.Name, &b.XboardNodeID, &b.XboardNodeType, &b.XuiPanel, &b.XuiInboundID,
 		&b.Protocol, &b.Flow, &enableInt,
 		&createdAtTS, &updatedAtTS,
 	)

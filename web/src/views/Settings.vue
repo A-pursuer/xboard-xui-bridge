@@ -32,7 +32,6 @@ import {
   Loader2,
   Save,
   Globe,
-  Server,
   Timer,
   Activity,
   FileText,
@@ -70,13 +69,7 @@ const canSave = canEdit
 const form = reactive({
   log: { level: 'info', file: '', max_size_mb: 0, max_backups: 0, max_age_days: 0 },
   xboard: { api_host: '', token: '', timeout_sec: 15, skip_tls_verify: false, user_agent: '' },
-  xui: {
-    api_host: '',
-    base_path: '',
-    api_token: '',
-    timeout_sec: 15,
-    skip_tls_verify: false,
-  },
+  // fork 多面板扩展：xui 段已迁出 settings，3x-ui 面板在 /panels 页管理。
   intervals: { user_pull_sec: 60, traffic_push_sec: 60, alive_push_sec: 60, status_push_sec: 60 },
   reporting: { alive_enabled: false, status_enabled: false },
   web: { listen_addr: '', session_max_age_hours: 0, absolute_max_lifetime_hours: 0 },
@@ -93,7 +86,6 @@ async function refresh(): Promise<void> {
     original.value = s
     Object.assign(form.log, s.log)
     Object.assign(form.xboard, s.xboard)
-    Object.assign(form.xui, s.xui)
     Object.assign(form.intervals, s.intervals)
     Object.assign(form.reporting, s.reporting)
     Object.assign(form.web, s.web)
@@ -108,7 +100,7 @@ async function refresh(): Promise<void> {
 function computePatch(): SettingsPatch {
   if (!original.value) return {}
   const patch: SettingsPatch = {}
-  const groups: (keyof Settings)[] = ['log', 'xboard', 'xui', 'intervals', 'reporting']
+  const groups: (keyof Settings)[] = ['log', 'xboard', 'intervals', 'reporting']
   for (const g of groups) {
     const cur = form[g] as Record<string, unknown>
     const orig = original.value[g] as Record<string, unknown>
@@ -168,7 +160,6 @@ interface AnchorEntry {
 
 const anchors: AnchorEntry[] = [
   { id: 'anchor-xboard',    labelKey: 'settings.anchorXboard',    icon: Globe },
-  { id: 'anchor-xui',       labelKey: 'settings.anchorXui',       icon: Server },
   { id: 'anchor-intervals', labelKey: 'settings.anchorIntervals', icon: Timer },
   { id: 'anchor-reporting', labelKey: 'settings.anchorReporting', icon: Activity },
   { id: 'anchor-log',       labelKey: 'settings.anchorLog',       icon: FileText },
@@ -378,56 +369,7 @@ function scrollToAnchor(id: string): void {
               </div>
             </section>
 
-            <!-- ========== 3x-ui ========== -->
-            <section id="anchor-xui" class="bento-tile scroll-mt-28">
-              <header class="mb-4 flex items-center gap-3">
-                <span
-                  class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400"
-                  aria-hidden="true"
-                >
-                  <Server class="h-5 w-5" />
-                </span>
-                <div class="flex-1">
-                  <h3 class="text-base font-semibold text-foreground">{{ t('settings.xui.title') }}</h3>
-                  <p class="text-xs text-muted-foreground">{{ t('settings.xui.subtitle') }}</p>
-                </div>
-              </header>
-
-              <Alert variant="info" role="status" class="mb-5">
-                <AlertDescription>{{ t('settings.xui.infoBanner') }}</AlertDescription>
-              </Alert>
-
-              <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-                <div>
-                  <Label for="s-xui-api_host">{{ t('settings.xui.fieldHost') }}</Label>
-                  <Input id="s-xui-api_host" v-model="form.xui.api_host" :placeholder="t('settings.xui.hostPlaceholder')" class="mt-1.5" />
-                </div>
-                <div>
-                  <Label for="s-xui-base_path">{{ t('settings.xui.fieldBasePath') }}</Label>
-                  <Input id="s-xui-base_path" v-model="form.xui.base_path" :placeholder="t('settings.xui.basePathPlaceholder')" class="mt-1.5" />
-                </div>
-                <div class="md:col-span-2">
-                  <Label for="s-xui-api_token">{{ t('settings.xui.fieldApiToken') }}</Label>
-                  <Input
-                    id="s-xui-api_token"
-                    v-model="form.xui.api_token"
-                    type="password"
-                    autocomplete="off"
-                    :placeholder="t('settings.xui.apiTokenPlaceholder')"
-                    class="mt-1.5 font-mono"
-                  />
-                  <p class="mt-1.5 text-xs text-muted-foreground">{{ t('settings.xui.apiTokenHelp') }}</p>
-                </div>
-                <div>
-                  <Label for="s-xui-timeout_sec">{{ t('settings.xui.fieldTimeout') }}</Label>
-                  <Input id="s-xui-timeout_sec" v-model.number="form.xui.timeout_sec" type="number" min="1" class="mt-1.5 font-mono" />
-                </div>
-                <div class="md:col-span-2 flex items-center gap-3">
-                  <Checkbox id="s-xui-skip_tls_verify" v-model="form.xui.skip_tls_verify" />
-                  <Label for="s-xui-skip_tls_verify" class="cursor-pointer">{{ t('settings.xui.skipTlsLabel') }}</Label>
-                </div>
-              </div>
-            </section>
+            <!-- 3x-ui 配置已迁移到「面板」页（fork 多面板扩展）：/panels -->
 
             <!-- ========== 同步周期 ========== -->
             <section id="anchor-intervals" class="bento-tile scroll-mt-28">

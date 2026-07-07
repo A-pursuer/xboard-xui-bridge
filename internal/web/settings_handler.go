@@ -30,16 +30,8 @@ type settingsResponse struct {
 		SkipTLSVerify bool   `json:"skip_tls_verify"`
 		UserAgent     string `json:"user_agent"`
 	} `json:"xboard"`
-	Xui struct {
-		APIHost  string `json:"api_host"`
-		BasePath string `json:"base_path"`
-		// v0.6 起仅 Bearer API Token 单通道（仅适配 3x-ui v3.0.0+）。
-		// admin 鉴权后明文回传 api_token，前端如需 mask 自行处理（与
-		// v0.2/v0.3 的 api_token 行为一致）。
-		APIToken      string `json:"api_token"`
-		TimeoutSec    int    `json:"timeout_sec"`
-		SkipTLSVerify bool   `json:"skip_tls_verify"`
-	} `json:"xui"`
+	// fork 多面板扩展：xui 段从 settings 移除——3x-ui 面板配置迁移到独立的
+	// /api/xui-panels CRUD 端点（xui_panels 表），不再是单例 settings 键。
 	Intervals struct {
 		UserPullSec    int `json:"user_pull_sec"`
 		TrafficPushSec int `json:"traffic_push_sec"`
@@ -96,12 +88,6 @@ func projectSettings(cfg *config.Root) settingsResponse {
 	r.Xboard.SkipTLSVerify = cfg.Xboard.SkipTLSVerify
 	r.Xboard.UserAgent = cfg.Xboard.UserAgent
 
-	r.Xui.APIHost = cfg.Xui.APIHost
-	r.Xui.BasePath = cfg.Xui.BasePath
-	r.Xui.APIToken = cfg.Xui.APIToken
-	r.Xui.TimeoutSec = cfg.Xui.TimeoutSec
-	r.Xui.SkipTLSVerify = cfg.Xui.SkipTLSVerify
-
 	r.Intervals.UserPullSec = cfg.Intervals.UserPullSec
 	r.Intervals.TrafficPushSec = cfg.Intervals.TrafficPushSec
 	r.Intervals.AlivePushSec = cfg.Intervals.AlivePushSec
@@ -137,12 +123,11 @@ type settingsPatchRequest struct {
 		SkipTLSVerify *bool   `json:"skip_tls_verify,omitempty"`
 		UserAgent     *string `json:"user_agent,omitempty"`
 	} `json:"xboard,omitempty"`
+	// fork 多面板扩展：xui 段不再接受——面板改动走 /api/xui-panels。
+	// 保留字段仅为向旧前端返回明确错误（见 handlePatchSettings 的显式拒绝）。
 	Xui *struct {
-		APIHost  *string `json:"api_host,omitempty"`
-		BasePath *string `json:"base_path,omitempty"`
-		// v0.6 起仅 Bearer API Token 单通道；所有 xui.* 字段都在"运行期可
-		// 热重载"集合内，不在"重启生效"白名单内。supervisor.Reload 重建
-		// xui.Client 时携带新 token，落实单一正向路径。
+		APIHost       *string `json:"api_host,omitempty"`
+		BasePath      *string `json:"base_path,omitempty"`
 		APIToken      *string `json:"api_token,omitempty"`
 		TimeoutSec    *int    `json:"timeout_sec,omitempty"`
 		SkipTLSVerify *bool   `json:"skip_tls_verify,omitempty"`
@@ -215,6 +200,12 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// fork 多面板扩展：xui.* 已迁移到 xui_panels 表，settings 不再承载。
+	if req.Xui != nil {
+		s.writeError(w, http.StatusBadRequest, errCodeBadRequest,
+			"3x-ui 配置已迁移到「面板」管理（/api/xui-panels），不再通过 settings 修改")
+		return
+	}
 	kv := buildSettingsKV(req)
 	if len(kv) == 0 {
 		// 客户端提交了空 body 或全 nil 字段；本接口需要至少一个字段。
@@ -276,13 +267,8 @@ func buildSettingsKV(req settingsPatchRequest) map[string]string {
 		setIfNotNilBool(kv, config.SettingXboardSkipTLSVerify, req.Xboard.SkipTLSVerify)
 		setIfNotNil(kv, config.SettingXboardUserAgent, req.Xboard.UserAgent)
 	}
-	if req.Xui != nil {
-		setIfNotNil(kv, config.SettingXuiAPIHost, req.Xui.APIHost)
-		setIfNotNil(kv, config.SettingXuiBasePath, req.Xui.BasePath)
-		setIfNotNil(kv, config.SettingXuiAPIToken, req.Xui.APIToken)
-		setIfNotNilInt(kv, config.SettingXuiTimeoutSec, req.Xui.TimeoutSec)
-		setIfNotNilBool(kv, config.SettingXuiSkipTLSVerify, req.Xui.SkipTLSVerify)
-	}
+	// 注意：req.Xui 已在 handlePatchSettings 入口被显式拒绝（多面板扩展后
+	// 3x-ui 配置走 /api/xui-panels）；本函数不再处理 xui.*。
 	if req.Intervals != nil {
 		setIfNotNilInt(kv, config.SettingIntervalsUserPullSec, req.Intervals.UserPullSec)
 		setIfNotNilInt(kv, config.SettingIntervalsTrafficPushSec, req.Intervals.TrafficPushSec)

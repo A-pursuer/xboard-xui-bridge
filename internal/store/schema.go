@@ -102,13 +102,33 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at INTEGER NOT NULL
 );
 
+-- ============ 3x-ui 面板 ============
+-- fork 多面板扩展：一个中间件实例可对接多台 3x-ui。每行对应一个面板的
+-- 访问参数（原 settings 表 xui.* 单例的多行化）。api_token 明文存储，
+-- 敏感度与 settings 表内的 xboard.token 相同，由 bridge.db 0600 权限兜底。
+-- 旧库升级：runLegacyXuiMigration 会把 settings 内残留的 xui.* 单例配置
+-- 迁移为名为 'default' 的面板，并把存量 bridges.xui_panel 指向它。
+CREATE TABLE IF NOT EXISTS xui_panels (
+    name            TEXT    NOT NULL PRIMARY KEY,
+    api_host        TEXT    NOT NULL DEFAULT '',
+    base_path       TEXT    NOT NULL DEFAULT '',
+    api_token       TEXT    NOT NULL DEFAULT '',
+    timeout_sec     INTEGER NOT NULL DEFAULT 0,
+    skip_tls_verify INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
 -- ============ 桥接配置 ============
 -- 与 config.Bridge 一一对应。enable 用 0/1（SQLite 没有原生 BOOL）。
 -- xboard_node_type 允许空串，为空时由业务侧按 protocol 推断（同 config.Validate 逻辑）。
+-- xui_panel 引用 xui_panels.name（无显式 FK 约束，删除面板前由业务侧
+-- CountBridgesByPanel 校验无引用；与 sessions.user_id 的处理方式一致）。
 CREATE TABLE IF NOT EXISTS bridges (
     name             TEXT    NOT NULL PRIMARY KEY,
     xboard_node_id   INTEGER NOT NULL,
     xboard_node_type TEXT    NOT NULL DEFAULT '',
+    xui_panel        TEXT    NOT NULL DEFAULT '',
     xui_inbound_id   INTEGER NOT NULL,
     protocol         TEXT    NOT NULL,
     flow             TEXT    NOT NULL DEFAULT '',

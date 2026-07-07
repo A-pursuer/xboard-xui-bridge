@@ -38,7 +38,8 @@
     "notLoggedIn": "未登录",
     "ariaMain": "主导航",
     "groupMain": "导航",
-    "engineLabel": "引擎"
+    "engineLabel": "引擎",
+    "panels": "3x-ui 面板"
   },
   "statusBar": {
     "aria": "顶部状态条",
@@ -156,7 +157,11 @@
     "okUpdated": "已更新并触发引擎重载",
     "okDeleted": "已删除 {name}",
     "emptyTitle": "暂无桥接",
-    "emptyHint": "点击右上方“新增桥接”按钮添加第一个映射。"
+    "emptyHint": "点击右上方“新增桥接”按钮添加第一个映射。",
+    "fieldPanel": "所属 3x-ui 面板",
+    "panelPlaceholder": "选择面板",
+    "errPanelEmpty": "请选择所属 3x-ui 面板（如列表为空，请先在「3x-ui 面板」页创建）",
+    "tablePanel": "3x-ui 面板"
   },
   "settings": {
     "title": "运行参数",
@@ -168,7 +173,6 @@
     "allSaved": "已与服务端一致",
     "anchorNavAria": "分组锚点导航",
     "anchorXboard": "Xboard 对接",
-    "anchorXui": "3x-ui 对接",
     "anchorIntervals": "同步周期",
     "anchorReporting": "上报开关",
     "anchorLog": "日志",
@@ -183,20 +187,6 @@
       "skipTlsLabel": "跳过 TLS 证书校验",
       "skipTlsHelp": "（仅自签证书内网部署可开启）",
       "hostPlaceholder": "https://panel.example.com"
-    },
-    "xui": {
-      "title": "3x-ui 面板对接",
-      "subtitle": "节点端面板的 API 令牌（仅适配 3x-ui v3.0.0+）",
-      "infoBanner": "v0.6 起本中间件仅支持 3x-ui v3.0.0+ 的 API 令牌（Bearer Token）鉴权——账号密码 / cookie / TOTP 路径已彻底移除。请在 3x-ui 后台「面板设置 → API 令牌」生成 48 字符令牌后填入下方。",
-      "fieldHost": "API 主机地址",
-      "fieldBasePath": "面板路径前缀（webBasePath）",
-      "basePathPlaceholder": "留空表示 /",
-      "fieldApiToken": "API 令牌",
-      "apiTokenPlaceholder": "粘贴 3x-ui 后台生成的 48 字符令牌",
-      "apiTokenHelp": "在 3x-ui v3.0.0+ 面板「面板设置 → API 令牌」点击「重新生成」即可获得；明文存储在中间件本地数据库，请保护好 bridge.db。",
-      "fieldTimeout": "请求超时（秒）",
-      "skipTlsLabel": "跳过 TLS 证书校验",
-      "hostPlaceholder": "http://127.0.0.1:2053"
     },
     "intervals": {
       "title": "同步周期（秒）",
@@ -263,5 +253,35 @@
     "strengthFair": "一般",
     "strengthGood": "良好",
     "strengthExcellent": "极佳"
+  },
+  "panels": {
+    "title": "3x-ui 面板",
+    "subtitle": "管理本实例对接的多台 3x-ui 面板（fork 多面板扩展）",
+    "addBtn": "新增面板",
+    "addTitle": "新增 3x-ui 面板",
+    "editTitle": "编辑面板 {name}",
+    "drawerSubtitle": "面板凭据保存后立即热重载生效；仅支持 3x-ui v3.0.0+ 的 API 令牌（Bearer Token）鉴权",
+    "fieldName": "面板名",
+    "namePlaceholder": "如 tokyo-1（保存后不可改名）",
+    "nameLockedHint": "面板名被桥接按名引用，不支持改名；如需改名请新建面板并迁移桥接",
+    "fieldHost": "API 服务地址",
+    "hostPlaceholder": "http://100.x.x.x:2053",
+    "fieldBasePath": "面板路径前缀（webBasePath）",
+    "basePathPlaceholder": "留空表示 /",
+    "fieldApiToken": "API 令牌",
+    "apiTokenPlaceholder": "粘贴 3x-ui 后台生成的 48 字符令牌",
+    "apiTokenHelp": "在该 3x-ui 面板「面板设置 → API 令牌」点击重新生成即可获得；令牌存储于中间件本地数据库，请保护好 bridge.db。",
+    "fieldTimeout": "请求超时（秒）",
+    "skipTlsLabel": "跳过 TLS 证书校验（仅内网自签可用）",
+    "bridgeCount": "{n} 条桥接引用",
+    "deleteConfirm": "确定删除面板 {name}？",
+    "deleteBlocked": "该面板仍被桥接引用，请先删除或迁移相关桥接",
+    "errNameEmpty": "面板名不可为空",
+    "errHostEmpty": "API 服务地址不可为空",
+    "okCreated": "面板已创建",
+    "okUpdated": "面板已保存",
+    "okDeleted": "面板 {name} 已删除",
+    "emptyTitle": "还没有任何 3x-ui 面板",
+    "emptyHint": "先添加一台 3x-ui 面板，然后到「桥接管理」为它创建桥接"
   }
 }

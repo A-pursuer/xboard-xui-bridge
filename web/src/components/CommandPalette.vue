@@ -62,6 +62,7 @@ import { useRouter } from 'vue-router'
 import {
   LayoutDashboard,
   Network,
+  Server,
   SlidersHorizontal,
   UserRound,
   Sun,
@@ -166,6 +167,7 @@ async function doRefresh(): Promise<void> {
 const items = computed<CmdItem[]>(() => [
   // ---- nav ----
   { id: 'nav-dashboard', group: 'nav', labelKey: 'nav.dashboard', icon: LayoutDashboard, action: () => goto('/dashboard') },
+  { id: 'nav-panels',    group: 'nav', labelKey: 'nav.panels',    icon: Server,          action: () => goto('/panels')    },
   { id: 'nav-bridges',   group: 'nav', labelKey: 'nav.bridges',   icon: Network,         action: () => goto('/bridges')   },
   { id: 'nav-settings',  group: 'nav', labelKey: 'nav.settings',  icon: SlidersHorizontal, action: () => goto('/settings') },
   { id: 'nav-account',   group: 'nav', labelKey: 'nav.account',   icon: UserRound,       action: () => goto('/account')   },

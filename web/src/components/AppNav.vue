@@ -29,7 +29,7 @@
 // rail / expanded 两态由 layout store 控制——状态条折叠按钮唯一切换源。
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { LayoutDashboard, Network, SlidersHorizontal, UserRound } from 'lucide-vue-next'
+import { LayoutDashboard, Network, Server, SlidersHorizontal, UserRound } from 'lucide-vue-next'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import LiveDot from './LiveDot.vue'
 import { useLayoutStore } from '@/stores/layout'
@@ -42,6 +42,7 @@ const { status, lastError: statusError } = useStatus()
 // 导航条目——与 router/index.ts 保持同步。
 const navItems = [
   { to: '/dashboard', labelKey: 'nav.dashboard' as const, icon: LayoutDashboard },
+  { to: '/panels',    labelKey: 'nav.panels'    as const, icon: Server },
   { to: '/bridges',   labelKey: 'nav.bridges'   as const, icon: Network },
   { to: '/settings',  labelKey: 'nav.settings'  as const, icon: SlidersHorizontal },
   { to: '/account',   labelKey: 'nav.account'   as const, icon: UserRound },

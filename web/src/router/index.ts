@@ -46,6 +46,13 @@ const router = createRouter({
       component: () => import('@/views/Bridges.vue'),
     },
     {
+      // fork 多面板扩展：3x-ui 面板管理。
+      path: '/panels',
+      name: 'panels',
+      meta: { layout: 'panel', requiresAuth: true },
+      component: () => import('@/views/Panels.vue'),
+    },
+    {
       path: '/settings',
       name: 'settings',
       meta: { layout: 'panel', requiresAuth: true },

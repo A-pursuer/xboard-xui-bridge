@@ -23,6 +23,7 @@ type bridgeResponse struct {
 	Name           string `json:"name"`
 	XboardNodeID   int    `json:"xboard_node_id"`
 	XboardNodeType string `json:"xboard_node_type"`
+	XuiPanel       string `json:"xui_panel"`
 	XuiInboundID   int    `json:"xui_inbound_id"`
 	Protocol       string `json:"protocol"`
 	Flow           string `json:"flow,omitempty"`
@@ -39,6 +40,7 @@ type bridgeRequest struct {
 	Name           string `json:"name"`
 	XboardNodeID   int    `json:"xboard_node_id"`
 	XboardNodeType string `json:"xboard_node_type"`
+	XuiPanel       string `json:"xui_panel"`
 	XuiInboundID   int    `json:"xui_inbound_id"`
 	Protocol       string `json:"protocol"`
 	Flow           string `json:"flow"`
@@ -85,6 +87,13 @@ func (s *Server) handleCreateBridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	row := bridgeFromRequest(req)
+	// 面板引用预检（fork 多面板扩展）：悬空引用若直接落库，reload 时
+	// config.Validate 会失败并让 handler 返回 5xx——语义正确但对用户不友好。
+	// 这里查一次真相源（xui_panels 表）提前给 400；不复制格式校验逻辑。
+	if code, msg := s.checkPanelRef(r, req.XuiPanel); code != 0 {
+		s.writeError(w, code, errCodeBadRequest, msg)
+		return
+	}
 	if err := s.store.CreateBridge(r.Context(), row); err != nil {
 		switch {
 		case errors.Is(err, store.ErrAlreadyExists):
@@ -147,6 +156,11 @@ func (s *Server) handleUpdateBridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	row := bridgeFromRequest(req)
+	// 面板引用预检：同 handleCreateBridge。
+	if code, msg := s.checkPanelRef(r, req.XuiPanel); code != 0 {
+		s.writeError(w, code, errCodeBadRequest, msg)
+		return
+	}
 	if err := s.store.UpdateBridge(r.Context(), row); err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
@@ -300,6 +314,26 @@ func (s *Server) handleDeleteBridge(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, struct{}{})
 }
 
+// checkPanelRef 校验桥接引用的面板名非空且存在于 xui_panels 表。
+//
+// 返回值：(0, "") 表示通过；否则返回应写给客户端的 HTTP 状态码与消息。
+// 查询故障按 500 处理——无法确认引用有效性时宁可拒绝写入，也不让悬空
+// 引用落库触发后续 reload 失败。
+func (s *Server) checkPanelRef(r *http.Request, panelName string) (int, string) {
+	name := strings.TrimSpace(panelName)
+	if name == "" {
+		return http.StatusBadRequest, "xui_panel 不可为空（请先在「面板」页创建 3x-ui 面板）"
+	}
+	if _, err := s.store.GetXuiPanel(r.Context(), name); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return http.StatusBadRequest, "xui_panel 引用的面板不存在：" + name
+		}
+		s.log.Error("校验面板引用失败", "panel", name, "err", err)
+		return http.StatusInternalServerError, "校验面板引用失败"
+	}
+	return 0, ""
+}
+
 // bridgeFromRequest 把请求 DTO 转换为 store.BridgeRow。
 //
 // 不做 trim / lower：这些规范化在 LoadFromStore 后的 Validate 中执行。
@@ -310,6 +344,7 @@ func bridgeFromRequest(req bridgeRequest) store.BridgeRow {
 		Name:           req.Name,
 		XboardNodeID:   req.XboardNodeID,
 		XboardNodeType: req.XboardNodeType,
+		XuiPanel:       req.XuiPanel,
 		XuiInboundID:   req.XuiInboundID,
 		Protocol:       req.Protocol,
 		Flow:           req.Flow,
@@ -325,6 +360,7 @@ func marshalBridge(row *store.BridgeRow) bridgeResponse {
 		Name:           row.Name,
 		XboardNodeID:   row.XboardNodeID,
 		XboardNodeType: row.XboardNodeType,
+		XuiPanel:       row.XuiPanel,
 		XuiInboundID:   row.XuiInboundID,
 		Protocol:       row.Protocol,
 		Flow:           row.Flow,

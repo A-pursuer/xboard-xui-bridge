@@ -22,10 +22,15 @@ type statusResponse struct {
 	EnabledBridgeCount int `json:"enabled_bridge_count"`
 	TotalBridgeCount   int `json:"total_bridge_count"`
 
-	// CredsComplete xboard / xui 凭据是否全部配置完整。运维一眼看到引擎
-	// 是否真在做事——半填状态下凭据不全 + supervisor.applyCredsGuard 会清空
-	// Bridges，导致 EnabledBridgeCount=0 但仍标 Running。
+	// CredsComplete xboard 凭据 + 全部面板凭据是否配置完整。运维一眼看到
+	// 引擎是否真在做事——半填状态下凭据不全 + supervisor.applyCredsGuard
+	// 会过滤对应 Bridges，导致 EnabledBridgeCount 缩水但仍标 Running。
 	CredsComplete bool `json:"creds_complete"`
+
+	// PanelCount / IncompletePanels（fork 多面板扩展）：面板总数与"凭据
+	// 未配齐"的面板名列表，让 Dashboard 能精确指出哪台 3x-ui 待补配置。
+	PanelCount       int      `json:"panel_count"`
+	IncompletePanels []string `json:"incomplete_panels,omitempty"`
 
 	// ListenAddr 当前 Web 监听地址；显示在状态页便于运维快速找到自己访问的入口。
 	ListenAddr string `json:"listen_addr"`
@@ -48,11 +53,18 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 				resp.EnabledBridgeCount++
 			}
 		}
-		// 委托给 config.{Xboard,Xui}.CredsComplete()——v0.6 起 xui 仅 Bearer
-		// API Token 单通道，CredsComplete 检查 api_host + api_token 两必填。
-		// supervisor.applyCredsGuard 共享同一份函数，确保 Dashboard "凭据
+		// 委托给 config.Xboard.CredsComplete() 与各面板的 CredsComplete()——
+		// supervisor.applyCredsGuard 共享同一组函数，确保 Dashboard "凭据
 		// 完整性" 灯与引擎实际是否运行结果一致。
-		resp.CredsComplete = cfg.Xboard.CredsComplete() && cfg.Xui.CredsComplete()
+		resp.PanelCount = len(cfg.XuiPanels)
+		for _, p := range cfg.XuiPanels {
+			if !p.CredsComplete() {
+				resp.IncompletePanels = append(resp.IncompletePanels, p.Name)
+			}
+		}
+		// 全局灯：Xboard 齐 + 至少一个面板 + 所有面板凭据齐。
+		resp.CredsComplete = cfg.Xboard.CredsComplete() &&
+			len(cfg.XuiPanels) > 0 && len(resp.IncompletePanels) == 0
 		resp.ListenAddr = cfg.Web.ListenAddr
 	}
 	s.writeJSON(w, http.StatusOK, resp)

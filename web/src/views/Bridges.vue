@@ -55,7 +55,7 @@ import { Switch } from '@/components/ui/switch'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import LiveDot from '@/components/LiveDot.vue'
 import { useToast } from '@/composables/useToast'
-import { api, type Bridge } from '@/api/client'
+import { api, type Bridge, type XuiPanel } from '@/api/client'
 
 const { t } = useI18n()
 const { toast } = useToast()
@@ -64,6 +64,8 @@ const protocols = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hyste
 const AUTO_SENTINEL = '__auto__'
 
 const bridges = ref<Bridge[]>([])
+// panels 供表单"所属面板"下拉使用（fork 多面板扩展）。
+const panels = ref<XuiPanel[]>([])
 const loading = ref(true)
 
 // 抽屉表单状态
@@ -75,6 +77,7 @@ const form = ref({
   name: '',
   xboard_node_id: 0,
   xboard_node_type: '',
+  xui_panel: '',
   xui_inbound_id: 0,
   protocol: 'vless',
   flow: '',
@@ -102,10 +105,19 @@ const selectXboardType = computed({
 async function refresh(): Promise<void> {
   loading.value = true
   try {
-    bridges.value = await api.listBridges()
-  } catch (e) {
-    console.warn(e)
-    toast({ title: t('errors.loadFailed'), variant: 'destructive' })
+    // 并行拉桥接与面板：面板列表供表单下拉，失败不阻断桥接列表展示。
+    const [bs, ps] = await Promise.allSettled([api.listBridges(), api.listPanels()])
+    if (bs.status === 'fulfilled') {
+      bridges.value = bs.value
+    } else {
+      console.warn(bs.reason)
+      toast({ title: t('errors.loadFailed'), variant: 'destructive' })
+    }
+    if (ps.status === 'fulfilled') {
+      panels.value = ps.value
+    } else {
+      console.warn(ps.reason)
+    }
   } finally {
     loading.value = false
   }
@@ -117,6 +129,8 @@ function openCreate(): void {
     name: '',
     xboard_node_id: 0,
     xboard_node_type: '',
+    // 单面板场景直接预选，免一次下拉操作；多面板时留空强制用户明确选择。
+    xui_panel: panels.value.length === 1 ? panels.value[0].name : '',
     xui_inbound_id: 0,
     protocol: 'vless',
     flow: '',
@@ -132,6 +146,7 @@ function openEdit(b: Bridge): void {
     name: b.name,
     xboard_node_id: b.xboard_node_id,
     xboard_node_type: b.xboard_node_type,
+    xui_panel: b.xui_panel,
     xui_inbound_id: b.xui_inbound_id,
     protocol: b.protocol,
     flow: b.flow ?? '',
@@ -145,6 +160,10 @@ async function submit(): Promise<void> {
   formError.value = ''
   if (!form.value.name) {
     formError.value = t('bridges.errNameEmpty')
+    return
+  }
+  if (!form.value.xui_panel) {
+    formError.value = t('bridges.errPanelEmpty')
     return
   }
   if (form.value.xboard_node_id <= 0 || form.value.xui_inbound_id <= 0) {
@@ -288,7 +307,10 @@ onMounted(refresh)
             <p class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
               {{ t('bridges.tableXuiInbound') }}
             </p>
-            <p class="mt-0.5 font-mono text-foreground">#{{ b.xui_inbound_id }}</p>
+            <p class="mt-0.5 font-mono text-foreground">
+              #{{ b.xui_inbound_id }}
+              <span class="text-muted-foreground">@{{ b.xui_panel }}</span>
+            </p>
           </div>
         </div>
 
@@ -380,6 +402,18 @@ onMounted(refresh)
                 </SelectContent>
               </Select>
             </div>
+          </div>
+
+          <div>
+            <Label for="bridge-xui-panel">{{ t('bridges.fieldPanel') }}</Label>
+            <Select v-model="form.xui_panel">
+              <SelectTrigger id="bridge-xui-panel" class="mt-1.5">
+                <SelectValue :placeholder="t('bridges.panelPlaceholder')" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="p in panels" :key="p.name" :value="p.name">{{ p.name }}</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           <div class="grid grid-cols-2 gap-4">

@@ -167,10 +167,13 @@ const (
 // 嵌套结构而不是平铺：因为各部分互不耦合，嵌套能让每个组件只接收自己关心
 // 的子配置（如 logger.New(cfg.Log)），保持单一职责。
 type Root struct {
-	Log       Log
-	State     State
-	Xboard    Xboard
-	Xui       Xui
+	Log    Log
+	State  State
+	Xboard Xboard
+	// XuiPanels 是 fork 多面板扩展：一个实例可对接多台 3x-ui。
+	// 每个面板由名字唯一标识，Bridge.XuiPanel 按名字引用。
+	// 数据来源是 xui_panels 表（不再是 settings 的 xui.* 单例键）。
+	XuiPanels []XuiPanel
 	Bridges   []Bridge
 	Intervals Intervals
 	Reporting Reporting
@@ -246,10 +249,22 @@ type Xui struct {
 	SkipTLSVerify bool
 }
 
-// Bridge 描述一对 (Xboard 节点, 3x-ui inbound) 的映射关系。
+// XuiPanel 是"命名的 Xui 配置"——fork 多面板扩展的核心类型。
+//
+// 嵌入 Xui 而非复制字段：xui.New(cfg config.Xui) 的签名保持不变，
+// supervisor 构造客户端时直接传 p.Xui 即可；Validate 对面板逐个执行与
+// 原单例完全相同的校验规则。
+type XuiPanel struct {
+	// Name：面板唯一名，被 Bridge.XuiPanel 引用；参与日志与 Web 下拉展示。
+	Name string
+	Xui
+}
+
+// Bridge 描述一组 (Xboard 节点, 3x-ui 面板, inbound) 的映射关系。
 //
 // 一个中间件实例可承载多个 Bridge：每个 Bridge 在引擎中独立运行四个同步循环，
-// 互不干扰。Bridge 之间共享同一份 Xboard / Xui 客户端实例（连接复用）。
+// 互不干扰。同一面板下的 Bridge 共享该面板的 3x-ui 客户端实例（连接复用）；
+// Xboard 客户端全局共享。
 type Bridge struct {
 	// Name：人类可读名称，用于日志区分；同一配置内必须唯一。
 	Name string
@@ -259,7 +274,9 @@ type Bridge struct {
 	// 注意：当 Xboard 节点类型是 hysteria 时，本字段填 hysteria；
 	// 至于实际是 v1 还是 v2，由 Protocol 字段决定（业务语义解耦）。
 	XboardNodeType string
-	// XuiInboundID：在 3x-ui 侧已经创建好的 inbound 数字 ID（管理员预创建）。
+	// XuiPanel：所属 3x-ui 面板名，引用 Root.XuiPanels[].Name；必填。
+	XuiPanel string
+	// XuiInboundID：在该面板上已经创建好的 inbound 数字 ID（管理员预创建）。
 	XuiInboundID int
 	// Protocol：见 ProtocolXxx 常量；决定协议适配器选择。
 	Protocol string
@@ -338,6 +355,10 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 	if err != nil {
 		return nil, fmt.Errorf("加载 bridges：%w", err)
 	}
+	panelRows, err := st.ListXuiPanels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("加载 xui_panels：%w", err)
+	}
 
 	dirty := make([]string, 0, 4)
 	root := &Root{
@@ -355,16 +376,6 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 			TimeoutSec:    parseSettingInt(settings, SettingXboardTimeoutSec, 0, &dirty),
 			SkipTLSVerify: parseSettingBool(settings, SettingXboardSkipTLSVerify, false, &dirty),
 			UserAgent:     settings[SettingXboardUserAgent],
-		},
-		Xui: Xui{
-			// 注：v0.4/v0.5 settings 表里残留的 xui.username / xui.password
-			// / xui.totp_secret / xui.auth_mode 行此处不再读——v0.6 已彻底
-			// 移除账号密码模式；残留 KV 无害保留但被 LoadFromStore 忽略。
-			APIHost:       settings[SettingXuiAPIHost],
-			BasePath:      settings[SettingXuiBasePath],
-			APIToken:      settings[SettingXuiAPIToken],
-			TimeoutSec:    parseSettingInt(settings, SettingXuiTimeoutSec, 0, &dirty),
-			SkipTLSVerify: parseSettingBool(settings, SettingXuiSkipTLSVerify, false, &dirty),
 		},
 		Intervals: Intervals{
 			UserPullSec:    parseSettingInt(settings, SettingIntervalsUserPullSec, 0, &dirty),
@@ -384,6 +395,21 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 		DirtyKeys: dirty,
 	}
 
+	// xui_panels 行表 → []XuiPanel：纯字段转换（fork 多面板扩展）。
+	root.XuiPanels = make([]XuiPanel, 0, len(panelRows))
+	for _, pr := range panelRows {
+		root.XuiPanels = append(root.XuiPanels, XuiPanel{
+			Name: pr.Name,
+			Xui: Xui{
+				APIHost:       pr.APIHost,
+				BasePath:      pr.BasePath,
+				APIToken:      pr.APIToken,
+				TimeoutSec:    pr.TimeoutSec,
+				SkipTLSVerify: pr.SkipTLSVerify,
+			},
+		})
+	}
+
 	// bridges 行表 → []Bridge：纯字段转换。Validate 后续会再做规范化（lower / trim 等）。
 	root.Bridges = make([]Bridge, 0, len(bridgeRows))
 	for _, br := range bridgeRows {
@@ -391,6 +417,7 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 			Name:           br.Name,
 			XboardNodeID:   br.XboardNodeID,
 			XboardNodeType: br.XboardNodeType,
+			XuiPanel:       br.XuiPanel,
 			XuiInboundID:   br.XuiInboundID,
 			Protocol:       br.Protocol,
 			Flow:           br.Flow,
@@ -460,30 +487,42 @@ func (r *Root) Validate() error {
 		r.Xboard.UserAgent = defaultXboardUserAgent
 	}
 
-	// ---------------- xui ----------------
-	r.Xui.APIHost = strings.TrimSpace(r.Xui.APIHost)
-	if r.Xui.APIHost != "" {
-		if err := validateHTTPHost("xui.api_host", r.Xui.APIHost); err != nil {
-			return err
+	// ---------------- xui panels（fork 多面板扩展）----------------
+	// 每个面板套用与原单例相同的校验规则；面板名唯一且非空。
+	// 面板数量允许为 0：首次启动 / GUI 还未配置时合法（与 bridges 同语义）。
+	seenPanel := make(map[string]struct{}, len(r.XuiPanels))
+	for i := range r.XuiPanels {
+		p := &r.XuiPanels[i]
+		p.Name = strings.TrimSpace(p.Name)
+		if p.Name == "" {
+			return fmt.Errorf("xui_panels[%d].name 不可为空", i)
 		}
-		r.Xui.APIHost = strings.TrimRight(r.Xui.APIHost, "/")
-	}
-	r.Xui.BasePath = normalizeBasePath(r.Xui.BasePath)
+		if _, dup := seenPanel[p.Name]; dup {
+			return fmt.Errorf("xui_panels[%d].name 重复：%q", i, p.Name)
+		}
+		seenPanel[p.Name] = struct{}{}
 
-	// APIToken trim：保留 trim 后的值供持久层回写时不带空格脏数据。
-	r.Xui.APIToken = strings.TrimSpace(r.Xui.APIToken)
-	// 允许为空 = 首次启动空载等待 Web 面板填配置；非空时做长度与字符集
-	// 轻量校验，避免运维把含空白 / 引号的脏数据存进 settings。3x-ui v3.0.0
-	// RegenerateApiToken 用 random.Seq(48) 输出，字符集仅含 [A-Za-z0-9]；
-	// 本中间件只校验"非空格 + 非控制字符 + 长度 ≥ 8"，给将来 3x-ui 改
-	// 字符集留余地，但不接受跨多行 / 含 quote 的明显脏数据。
-	if r.Xui.APIToken != "" {
-		if err := validateAPITokenShape("xui.api_token", r.Xui.APIToken); err != nil {
-			return err
+		p.APIHost = strings.TrimSpace(p.APIHost)
+		if p.APIHost != "" {
+			if err := validateHTTPHost(fmt.Sprintf("xui_panels[%s].api_host", p.Name), p.APIHost); err != nil {
+				return err
+			}
+			p.APIHost = strings.TrimRight(p.APIHost, "/")
 		}
-	}
-	if r.Xui.TimeoutSec <= 0 {
-		r.Xui.TimeoutSec = defaultXuiTimeoutSec
+		p.BasePath = normalizeBasePath(p.BasePath)
+
+		// APIToken trim：保留 trim 后的值供持久层回写时不带空格脏数据。
+		// 允许为空 = 面板刚创建等待运维填 token；非空时做长度与字符集
+		// 轻量校验（同原单例规则，详见 validateAPITokenShape 注释）。
+		p.APIToken = strings.TrimSpace(p.APIToken)
+		if p.APIToken != "" {
+			if err := validateAPITokenShape(fmt.Sprintf("xui_panels[%s].api_token", p.Name), p.APIToken); err != nil {
+				return err
+			}
+		}
+		if p.TimeoutSec <= 0 {
+			p.TimeoutSec = defaultXuiTimeoutSec
+		}
 	}
 
 	// ---------------- bridges ----------------
@@ -507,6 +546,17 @@ func (r *Root) Validate() error {
 		}
 		if b.XuiInboundID <= 0 {
 			return fmt.Errorf("bridges[%s].xui_inbound_id 必须为正整数", b.Name)
+		}
+
+		// XuiPanel 必须引用已存在的面板。空引用 fail-fast——旧库升级由
+		// store.runLegacyXuiMigration 保证回填 'default'，新建桥接由 Web
+		// 表单强制选择，正常路径不会出现空值。
+		b.XuiPanel = strings.TrimSpace(b.XuiPanel)
+		if b.XuiPanel == "" {
+			return fmt.Errorf("bridges[%s].xui_panel 不可为空（请指定所属 3x-ui 面板）", b.Name)
+		}
+		if _, ok := seenPanel[b.XuiPanel]; !ok {
+			return fmt.Errorf("bridges[%s].xui_panel 引用了不存在的面板：%q", b.Name, b.XuiPanel)
 		}
 
 		b.Protocol = strings.ToLower(strings.TrimSpace(b.Protocol))
@@ -592,6 +642,20 @@ func (r *Root) Validate() error {
 // 杜绝"supervisor 觉得 OK 但 UI 显示未完整"或反向不一致的运维心智负担。
 func (x Xboard) CredsComplete() bool {
 	return x.APIHost != "" && x.Token != ""
+}
+
+// FindXuiPanel 按名字查找面板；第二返回值表示是否存在。
+//
+// 供 supervisor（构造客户端 / 凭据护栏）与 web/status_handler（面板凭据灯）
+// 共用，杜绝两处各写一遍线性查找导致行为漂移。面板数量极少（个位数），
+// 线性扫描优于维护一份冗余 map。
+func (r *Root) FindXuiPanel(name string) (XuiPanel, bool) {
+	for i := range r.XuiPanels {
+		if r.XuiPanels[i].Name == name {
+			return r.XuiPanels[i], true
+		}
+	}
+	return XuiPanel{}, false
 }
 
 // CredsComplete 判断 3x-ui 鉴权所需的凭据是否填齐。

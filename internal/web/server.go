@@ -275,6 +275,12 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("PUT /api/bridges/{name}", writeChain(s.handleUpdateBridge))
 	mux.HandleFunc("DELETE /api/bridges/{name}", writeChain(s.handleDeleteBridge))
 
+	// 5.5 3x-ui 面板管理（fork 多面板扩展）。
+	mux.HandleFunc("GET /api/xui-panels", authChain(s.handleListPanels))
+	mux.HandleFunc("POST /api/xui-panels", writeChain(s.handleCreatePanel))
+	mux.HandleFunc("PUT /api/xui-panels/{name}", writeChain(s.handleUpdatePanel))
+	mux.HandleFunc("DELETE /api/xui-panels/{name}", writeChain(s.handleDeletePanel))
+
 	// 6. 引擎状态。
 	mux.HandleFunc("GET /api/status", authChain(s.handleGetStatus))
 

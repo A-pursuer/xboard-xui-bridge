@@ -211,17 +211,25 @@ func runDaemon(args []string) {
 			"hint", "登录 Web 面板补齐后重启进程",
 		)
 	}
-	// v0.6 起 xui 仅 Bearer API Token 单通道：必须 api_host + api_token 都
-	// 填齐才视为完整。复用 config.Xui.CredsComplete 与 supervisor /
-	// status_handler 共享同一份判定（不在此处手写 OR 表达式重蹈
-	// "凭据完整性灯不一致" 覆辙）。
-	if !cfg.Xui.CredsComplete() {
-		log.Warn("3x-ui 凭据未配置",
-			"event", "xui_creds_missing",
-			"api_host_set", cfg.Xui.APIHost != "",
-			"api_token_set", cfg.Xui.APIToken != "",
-			"hint", "登录 Web 面板补齐后重启进程",
+	// fork 多面板扩展：逐面板做"半填"提示。面板数为 0 也提示——首次启动
+	// 需要运维先在 Web 面板创建面板再建桥接。复用 config.Xui.CredsComplete
+	// 与 supervisor / status_handler 共享同一份判定。
+	if len(cfg.XuiPanels) == 0 {
+		log.Warn("尚未配置任何 3x-ui 面板",
+			"event", "xui_panels_empty",
+			"hint", "登录 Web 面板，在「3x-ui 面板」页创建面板后再添加桥接",
 		)
+	}
+	for _, p := range cfg.XuiPanels {
+		if !p.CredsComplete() {
+			log.Warn("3x-ui 面板凭据未配置完整",
+				"event", "xui_creds_missing",
+				"panel", p.Name,
+				"api_host_set", p.APIHost != "",
+				"api_token_set", p.APIToken != "",
+				"hint", "登录 Web 面板补齐该面板的凭据",
+			)
+		}
 	}
 
 	// 装配 supervisor。

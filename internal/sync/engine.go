@@ -95,9 +95,13 @@ type Engine struct {
 
 // New 把配置 + 客户端 + 状态库装配成 Engine。
 //
-// 失败原因：协议适配器构造失败（出现配置中未实现的协议名）。这种错误属于
-// 启动期错误，应当让进程退出。
-func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiC *xui.Client, st store.Store) (*Engine, error) {
+// fork 多面板扩展：xuiClients 按面板名索引（由 supervisor.buildEngine 为
+// 每个被引用面板构造），worker 装配时按 b.XuiPanel 取自己面板的客户端。
+//
+// 失败原因：协议适配器构造失败（出现配置中未实现的协议名），或 bridge
+// 引用的面板没有对应客户端（supervisor 构造遗漏，属编程错误）。这种错误
+// 属于启动期错误，应当让进程退出。
+func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiClients map[string]*xui.Client, st store.Store) (*Engine, error) {
 	workers := make([]*bridgeWorker, 0, len(cfg.Bridges))
 	for i := range cfg.Bridges {
 		b := cfg.Bridges[i]
@@ -109,6 +113,10 @@ func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiC *xui.C
 		if err != nil {
 			return nil, err
 		}
+		xuiC, ok := xuiClients[b.XuiPanel]
+		if !ok || xuiC == nil {
+			return nil, fmt.Errorf("bridge %s 引用的面板 %q 未构造 3x-ui 客户端（supervisor 装配缺陷）", b.Name, b.XuiPanel)
+		}
 		w := &bridgeWorker{
 			cfg:       b,
 			intervals: cfg.Intervals,
@@ -117,7 +125,7 @@ func New(cfg *config.Root, log *slog.Logger, xboardC *xboard.Client, xuiC *xui.C
 			xboardC:   xboardC,
 			xuiC:      xuiC,
 			store:     st,
-			log:       log.With("module", "sync", "bridge", b.Name, "protocol", b.Protocol),
+			log:       log.With("module", "sync", "bridge", b.Name, "panel", b.XuiPanel, "protocol", b.Protocol),
 		}
 		workers = append(workers, w)
 	}

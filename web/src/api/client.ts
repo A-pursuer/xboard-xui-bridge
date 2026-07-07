@@ -111,6 +111,7 @@ export interface Bridge {
   name: string
   xboard_node_id: number
   xboard_node_type: string
+  xui_panel: string
   xui_inbound_id: number
   protocol: string
   flow?: string
@@ -119,20 +120,25 @@ export interface Bridge {
   updated_at?: string
 }
 
+// XuiPanel（fork 多面板扩展）：一台 3x-ui 面板的访问参数。
+// bridge_count 是后端附带的引用计数，删除前端据此禁用按钮。
+export interface XuiPanel {
+  name: string
+  api_host: string
+  base_path: string
+  api_token: string
+  timeout_sec: number
+  skip_tls_verify: boolean
+  bridge_count?: number
+  created_at?: string
+  updated_at?: string
+}
+
 export interface Settings {
   log: { level: string; file: string; max_size_mb: number; max_backups: number; max_age_days: number }
   xboard: { api_host: string; token: string; timeout_sec: number; skip_tls_verify: boolean; user_agent: string }
-  // xui v0.6 起仅 Bearer API Token 单通道（仅适配 3x-ui v3.0.0+）。
-  // 账号密码 / cookie / CSRF / TOTP 路径已彻底移除——旧 settings 表里残留
-  // 的 username / password / totp_secret / auth_mode 行被后端 LoadFromStore
-  // 忽略，前端类型也不再暴露。
-  xui: {
-    api_host: string
-    base_path: string
-    api_token: string
-    timeout_sec: number
-    skip_tls_verify: boolean
-  }
+  // fork 多面板扩展：xui 段已从 settings 移除，3x-ui 面板配置走
+  // /api/xui-panels（见 XuiPanel 与 api.listPanels 等方法）。
   intervals: { user_pull_sec: number; traffic_push_sec: number; alive_push_sec: number; status_push_sec: number }
   reporting: { alive_enabled: boolean; status_enabled: boolean }
   web: { listen_addr: string; session_max_age_hours: number; absolute_max_lifetime_hours: number }
@@ -147,6 +153,8 @@ export interface Status {
   enabled_bridge_count: number
   total_bridge_count: number
   creds_complete: boolean
+  panel_count: number
+  incomplete_panels?: string[]
   listen_addr: string
   now: string
 }
@@ -195,6 +203,20 @@ export const api = {
   },
   deleteBridge(name: string) {
     return request<void>(`/api/bridges/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  },
+
+  // ---- xui panels（fork 多面板扩展）----
+  listPanels() {
+    return request<XuiPanel[]>('/api/xui-panels')
+  },
+  createPanel(p: Omit<XuiPanel, 'bridge_count' | 'created_at' | 'updated_at'>) {
+    return request<XuiPanel>('/api/xui-panels', { method: 'POST', body: p })
+  },
+  updatePanel(name: string, p: Omit<XuiPanel, 'bridge_count' | 'created_at' | 'updated_at'>) {
+    return request<XuiPanel>(`/api/xui-panels/${encodeURIComponent(name)}`, { method: 'PUT', body: p })
+  },
+  deletePanel(name: string) {
+    return request<void>(`/api/xui-panels/${encodeURIComponent(name)}`, { method: 'DELETE' })
   },
 
   // ---- status ----
