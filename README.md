@@ -16,7 +16,7 @@
 > 本仓库是 [ZeroStarlet/xboard-xui-bridge](https://github.com/ZeroStarlet/xboard-xui-bridge) 的 fork，
 > 在上游基础上**新增了多面板能力**：一个中间件实例可同时对接**多台 3x-ui 面板**
 > （即多台节点 VPS），配合 Web 面板集中管理。安装脚本与 Release 均指向本 fork
-> （`A-pursuer/xboard-xui-bridge`）。
+> （`A-pursuer/x-bridge`）。
 
 > [!IMPORTANT]
 > 本项目仅用于个人使用和通信，请勿将其用于非法目的。
@@ -47,7 +47,7 @@ Tailscale 内网。
 ### 一键安装（Linux）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/A-pursuer/xboard-xui-bridge/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/A-pursuer/x-bridge/main/install.sh)
 ```
 
 未安装则安装最新 Release，已安装则进入管理菜单。二进制经 SHA256 校验后落地。

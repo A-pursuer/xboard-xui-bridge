@@ -6,7 +6,7 @@
 #
 # 用法：
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/ZeroStarlet/xboard-xui-bridge/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/A-pursuer/x-bridge/main/install.sh)
 #       默认行为：未装 → 安装；已装 → 进入管理菜单。
 #
 #   xui-bridge [子命令]                    安装后可用的快捷命令
@@ -99,7 +99,7 @@ err_trap() {
 trap err_trap ERR
 
 # ---------------- 常量 ----------------
-GITHUB_REPO="A-pursuer/xboard-xui-bridge"
+GITHUB_REPO="A-pursuer/x-bridge"
 INSTALL_DIR="/usr/local/xboard-xui-bridge"
 DATA_DIR="${INSTALL_DIR}/data"
 BACKUP_DIR="${INSTALL_DIR}/backups"
