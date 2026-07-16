@@ -620,21 +620,24 @@ func clientSettingsToPayload(s ClientSettings) ClientPayload {
 }
 
 // GetClientIPs 调用 POST /panel/api/clients/ips/:email，
-// 返回字符串数组形态的 IP 历史（含时间戳）。
+// 返回该 client 当前记录过的 IP 列表。
 //
 // v3.3+ 把端点从 /panel/api/inbounds/clientIps/:email 搬到
-// /panel/api/clients/ips/:email；响应形态与协议合法响应判定逻辑不变。
+// /panel/api/clients/ips/:email。v3.5 前后该端点又从字符串数组扩展为
+// ClientIpInfo 对象数组（含 ip/time/node），本函数统一归一化为 []string。
 //
 // 中间件主要用 GetOnlines() 拿在线 email，再拿 GetClientIPs 找该 email 当下使用的 IP。
-// 时间戳信息保留在原始字符串中（"1.2.3.4 (2024-01-02 15:04:05)"），调用方自行解析。
+// 对旧版字符串数组，时间戳信息保留在原始字符串中
+// （"1.2.3.4 (2024-01-02 15:04:05)"），调用方自行解析；对新版对象数组，
+// 只取 ip 字段，time/node 仅供 3x-ui UI 展示，alive 上报不需要。
 //
-// 协议合法响应形态（仅以下三种被视为成功，全部映射为 (nil, nil) 或数组）：
+// 协议合法响应形态（仅以下形态被视为成功，全部映射为 (nil, nil) 或数组）：
 //
 //	a) obj=null 或空 body                  → (nil, nil)（IP 表无该 email 行）
 //	b) obj 为字符串 "No IP Record"          → (nil, nil)（3x-ui 主线 controller
 //	                                          在 inboundService.GetInboundClientIps
 //	                                          返回空 / err 时显式输出该字面值）
-//	c) obj 为 JSON 数组（可空）              → 转切片返回
+//	c) obj 为 JSON 数组（可空）              → 元素可为旧版字符串或新版 {ip,time,node}
 //
 // 任何其它形态（数字 / 对象 / 其它字符串等）一律视为协议错误向上传播——
 // 这不是失败兜底，是"无数据 vs 协议异常"语义边界的显式拦截，避免静默
@@ -648,10 +651,10 @@ func (c *Client) GetClientIPs(ctx context.Context, email string) ([]string, erro
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
-	// 数组形态：直接解码返回。
+	// 数组形态：兼容旧版字符串元素，以及新版 ClientIpInfo 对象元素。
 	if raw[0] == '[' {
-		var out []string
-		if err := json.Unmarshal(raw, &out); err != nil {
+		out, err := decodeClientIPEntries(raw)
+		if err != nil {
 			return nil, fmt.Errorf("解码 %s 响应：%w", endpoint, err)
 		}
 		return out, nil
@@ -672,6 +675,58 @@ func (c *Client) GetClientIPs(ctx context.Context, email string) ([]string, erro
 	}
 	// 数字 / 对象 / 布尔等其它类型：协议异常，立即报错。
 	return nil, fmt.Errorf("解码 %s 响应：obj 既非数组也非 \"No IP Record\"：%s", endpoint, truncate(string(raw), 128))
+}
+
+func decodeClientIPEntries(raw json.RawMessage) ([]string, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for i, entry := range entries {
+		entry = bytes.TrimSpace(entry)
+		if len(entry) == 0 {
+			return nil, fmt.Errorf("第 %d 项为空", i)
+		}
+		switch entry[0] {
+		case '"':
+			var ip string
+			if err := json.Unmarshal(entry, &ip); err != nil {
+				return nil, fmt.Errorf("第 %d 项字符串解码失败：%w", i, err)
+			}
+			out = append(out, ip)
+		case '{':
+			ip, ok, err := decodeClientIPObject(entry)
+			if err != nil {
+				return nil, fmt.Errorf("第 %d 项对象 ip 字段无效：%w", i, err)
+			}
+			if !ok {
+				return nil, fmt.Errorf("第 %d 项对象缺少 ip 字段", i)
+			}
+			if ip != "" {
+				out = append(out, ip)
+			}
+		default:
+			return nil, fmt.Errorf("第 %d 项既非字符串也非对象：%s", i, truncate(string(entry), 128))
+		}
+	}
+	return out, nil
+}
+
+func decodeClientIPObject(raw json.RawMessage) (string, bool, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return "", false, err
+	}
+	field, ok := obj["ip"]
+	if !ok {
+		return "", false, nil
+	}
+	var ip string
+	if err := json.Unmarshal(field, &ip); err != nil {
+		return "", true, err
+	}
+	return ip, true, nil
 }
 
 // GetOnlines 调用 POST /panel/api/clients/onlines；返回当前在线的 email 列表。
